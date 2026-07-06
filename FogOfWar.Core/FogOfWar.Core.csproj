@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>FogOfWar</AssemblyName>
+    <RootNamespace>FogOfWar</RootNamespace>
+    <!-- The BVH/SIMD engine uses [SkipLocalsInit] (BvhSimd / Bvh scratch stacks), which requires this flag. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- Fog-of-War visibility engine: reads the map's world_physics collision mesh in-process at map load
+       (VRF = Source2Viewer library). Heavy transitive deps land in the module folder via
+       CopyLocalLockFileAssemblies (Directory.Build.props). -->
+  <ItemGroup>
+    <PackageReference Include="ValveResourceFormat" Version="19.2.6339" />
+  </ItemGroup>
+
+  <!-- Trim VRF's native runtimes/ bloat (~546MB of SkiaSharp / spirv-cross / TinyEXR / blake3 native libs
+       for every RID). The physics / KV3 / NTRO load path this module uses (Package + Resource +
+       PhysAggregateData -> triangle soup) never P/Invokes any of them (confirmed by the VRF author), so the
+       RID-specific native copy-local assets are dropped before they are staged into the module folder. This
+       takes the module from ~551MB to ~4MB. The managed VRF assemblies (SkiaSharp.dll etc., top-level) stay —
+       only the unused native runtimes/<rid>/ tree is removed. -->
+  <Target Name="TrimVrfNativeRuntimes" AfterTargets="ResolveReferences">
+    <ItemGroup>
+      <ReferenceCopyLocalPaths
+        Remove="@(ReferenceCopyLocalPaths)"
+        Condition="'%(ReferenceCopyLocalPaths.DestinationSubDirectory)' != '' and $([System.String]::Copy('%(ReferenceCopyLocalPaths.DestinationSubDirectory)').StartsWith('runtimes'))" />
+    </ItemGroup>
+  </Target>
+
+</Project>

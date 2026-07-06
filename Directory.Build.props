@@ -1,0 +1,38 @@
+<Project>
+  <PropertyGroup>
+    <ADRoot>$(MSBuildThisFileDirectory)</ADRoot>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>14</LangVersion>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>x64</PlatformTarget>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <!-- Library projects don't copy NuGet deps by default — bundle them so any runtime deps
+         land in the module folder. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <!-- Pin version: the shell exports version=N/A which otherwise poisons NuGet restore. -->
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <!-- Standard modsharp-deploy layout: everything is a module here. -->
+  <PropertyGroup>
+    <OutputPath>$(ADRoot).build\modules\$(MSBuildProjectName)\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="obj\**" />
+    <EmbeddedResource Remove="obj\**" />
+    <None Remove="obj\**" />
+  </ItemGroup>
+
+  <!-- ModSharp APIs via NuGet (latest). Shared assemblies are provided by the server, not copied.
+       AdminManager.Shared only — FOW consumes IAdminManager for the fow_test debug gate; nothing else. -->
+  <ItemGroup>
+    <PackageReference Include="ModSharp.Sharp.Shared" Version="*" ExcludeAssets="runtime" />
+    <PackageReference Include="ModSharp.Sharp.Modules.AdminManager.Shared" Version="*" ExcludeAssets="runtime" />
+  </ItemGroup>
+</Project>
