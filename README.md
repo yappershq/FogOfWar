@@ -6,6 +6,7 @@
 <p align="center">
   <a href="https://github.com/Kxnrl/modsharp-public"><img src="https://img.shields.io/badge/framework-ModSharp-5865F2?logo=github" alt="ModSharp"></a>
   <img src="https://img.shields.io/badge/game-CS2-orange" alt="CS2">
+  <img src="https://img.shields.io/github/license/yappershq/FogOfWar" alt="License">
   <img src="https://img.shields.io/github/stars/yappershq/FogOfWar?style=flat&logo=github" alt="Stars">
 </p>
 
