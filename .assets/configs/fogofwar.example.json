@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "updateIntervalMs": 15,
+  "minLookaheadMs": 180,
+  "maxLookaheadMs": 250,
+  "assumedRttMs": 60,
+  "peekMarginUnits": 21,
+  "visibilityHoldMs": 150,
+  "maxPredictionSpeed": 500,
+  "staleVisibleMs": 250,
+  "hideWeapons": true,
+  "transmitChannel": 3,
+  "debugStatus": false,
+  "extraSeeThroughProps": []
+}

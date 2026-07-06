@@ -28,10 +28,12 @@ namespace FogOfWar.Engine;
 ///
 ///     <para><b>Opacity decision (generic, zero per-map hardcoding):</b> the PRIMARY signal is the game's own
 ///     per-shape <b>interaction layers</b> (VRF exposes them as the collision attribute's
-///     <c>m_InteractAsStrings</c> tag set — see <c>SafeTagStrings</c>). A shape whose layers mark it
-///     <i>non-vision-blocking</i> — CS2's authored see-through layers <c>passbullets</c>
-///     (<c>InteractionLayers.PassBullets</c>) / <c>window</c> (<c>InteractionLayers.Window</c>) — is dropped as
-///     see-through, generically across every map. A layer that <i>definitively</i> blocks vision
+///     <c>m_InteractAsStrings</c> tag set — see <c>SafeTagStrings</c>). A <c>window</c>
+///     (<c>InteractionLayers.Window</c>) layer is a genuine transparent material and is dropped as see-through
+///     at any thickness; a <c>passbullets</c> (<c>InteractionLayers.PassBullets</c>) layer only means bullets
+///     penetrate — NOT that vision does (a thin wood wall / breakable is bullet-penetrable yet opaque) — so it
+///     is dropped as see-through ONLY when the shape is ALSO geometrically thin (a railing / grate), never
+///     through a thick bullet-penetrable wall. A layer that <i>definitively</i> blocks vision
 ///     (<c>blocklos</c> = <c>InteractionLayers.BlockLos</c>, <c>opaque</c> = <c>InteractionLayers.CStrikeOpaque</c>)
 ///     force-bakes the shape and overrides the fallbacks below (leak-safe).</para>
 ///
@@ -72,12 +74,21 @@ internal static class MapCollisionLoader
     };
 
     /// <summary>
-    ///     Interaction-layer tag substrings that mark a shape as <b>see-through</b> (bullets/vision pass) — CS2's
-    ///     own authored layers (<c>InteractionLayers.PassBullets</c> / <c>InteractionLayers.Window</c>). A shape
-    ///     carrying one of these (and no vision-blocking layer) is NOT baked as an occluder. These are the game's
-    ///     engine layer names, not map or surfaceprop names → generic across every map, zero hardcoding.
+    ///     Interaction-layer tag substrings that hint a shape is <b>see-through</b> — CS2's own authored layers.
+    ///     The two are NOT equivalent for VISION and are classified separately (see <see cref="ClassifyLayerOpacity" />):
+    ///     <list type="bullet">
+    ///       <item><c>window</c> (<c>InteractionLayers.Window</c>) — a genuine transparent material; vision passes
+    ///             at ANY thickness (like glass) → dropped unconditionally.</item>
+    ///       <item><c>passbullets</c> (<c>InteractionLayers.PassBullets</c>) — <b>bullets</b> penetrate, which does
+    ///             NOT imply vision passes (a thin wood wall / breakable is bullet-penetrable yet OPAQUE). Trusted
+    ///             as a see-through signal ONLY when the shape is ALSO geometrically thin (a railing / grate), so a
+    ///             thick bullet-penetrable wall is never carved open.</item>
+    ///     </list>
+    ///     These are the game's engine layer names, not map or surfaceprop names → generic across every map, zero
+    ///     hardcoding.
     /// </summary>
-    private static readonly string[] SeeThroughLayerMarkers = { "passbullets", "window" };
+    private const string WindowLayerMarker      = "window";
+    private const string PassBulletsLayerMarker = "passbullets";
 
     /// <summary>
     ///     Interaction-layer tag substrings that <b>definitively</b> block vision (<c>InteractionLayers.BlockLos</c>
@@ -92,11 +103,21 @@ internal static class MapCollisionLoader
         /// <summary>No decisive layer (empty tag set / clip-only) → defer to today's behavior (surfaceprop fallback).</summary>
         Unknown = 0,
 
-        /// <summary>An authored see-through layer (passbullets/window) and no vision-blocking layer → exclude.</summary>
-        SeeThrough = 1,
+        /// <summary>
+        ///     A <c>window</c> layer (genuine transparent material) and no vision-blocking layer → exclude at ANY
+        ///     thickness. A window passes vision by material, like glass.
+        /// </summary>
+        SeeThroughWindow = 1,
+
+        /// <summary>
+        ///     A <c>passbullets</c> layer (bullet-penetrable) and no vision-blocking layer → exclude ONLY when the
+        ///     shape is ALSO geometrically thin. "Bullets pass" is NOT "vision passes": a thin wood wall /
+        ///     breakable is bullet-penetrable yet OPAQUE, so a thick passbullets shape stays baked (no leak).
+        /// </summary>
+        SeeThroughPassBullets = 2,
 
         /// <summary>An authored vision-blocking layer (blocklos/opaque) → force-bake, overrides fallbacks.</summary>
-        VisionBlocking = 2,
+        VisionBlocking = 3,
     }
 
     /// <summary>World_physics resource extensions, in preference order (embedded vmdl phys is the fallback).</summary>
@@ -312,11 +333,15 @@ internal static class MapCollisionLoader
 
             Bump(stats.ByCollisionTags, tagsStr);
 
-            // PRIMARY (generic, zero hardcoding): the game's own interaction layers. A shape the engine authored
-            // as see-through (passbullets/window, and NOT vision-blocking) is not an occluder — drop it. This is
-            // the map-agnostic signal that kills the fence/grate/vent false-hide class wherever it is tagged. Not
-            // gated on thinness: an authored passbullets layer is a definitive see-through signal on its own.
-            if (opacity == LayerOpacity.SeeThrough)
+            // PRIMARY (generic, zero hardcoding): the game's own interaction layers.
+            //  - window: a genuine transparent material → see-through at ANY thickness (like glass); drop it.
+            //  - passbullets: bullets PENETRATE, which is NOT the same as "you can see through it" — a thin wood
+            //    wall / breakable is bullet-penetrable yet OPAQUE. So trust passbullets as a VISION see-through
+            //    signal ONLY when the shape is ALSO geometrically thin (a de_mirage railing / grate). A thick
+            //    passbullets wall falls through and stays baked as an occluder → no wallhack leak. Fails toward
+            //    INCLUDE (opaque) on ambiguity: an un-thin passbullets shape is kept solid.
+            if (opacity == LayerOpacity.SeeThroughWindow
+                || (opacity == LayerOpacity.SeeThroughPassBullets && shapeThin))
             {
                 stats.ExcludedByOpacityLayer++;
                 Bump(stats.ExcludedByOpacityTag, tagsStr);
@@ -487,15 +512,21 @@ internal static class MapCollisionLoader
 
     /// <summary>
     ///     Classify a collision attribute's vision-opacity from its interaction-layer tag set. Vision-blocking
-    ///     layers win over see-through (a mixed set errs opaque → no leak); an empty / clip-only / otherwise
-    ///     undecided set returns <see cref="LayerOpacity.Unknown" /> so the caller keeps today's behavior.
+    ///     layers win over any see-through hint (a mixed set errs opaque → no leak). A <c>window</c> layer is a
+    ///     genuine transparent material (see-through at any thickness); a <c>passbullets</c> layer only means
+    ///     bullets penetrate, so it is reported as a SEPARATE, thinness-gated signal (a thick bullet-penetrable
+    ///     wall is opaque — see <see cref="LayerOpacity.SeeThroughPassBullets" />, gated in <c>Emit</c>). An empty
+    ///     / clip-only / otherwise undecided set returns <see cref="LayerOpacity.Unknown" /> so the caller keeps
+    ///     the surfaceprop-name fallback. If BOTH window and passbullets are present, window wins (the stronger,
+    ///     ungated see-through signal).
     /// </summary>
     private static LayerOpacity ClassifyLayerOpacity(IReadOnlyCollection<string> tags)
     {
         if (tags.Count == 0)
             return LayerOpacity.Unknown;
 
-        var seeThrough = false;
+        var window      = false;
+        var passBullets = false;
         foreach (var tag in tags)
         {
             foreach (var marker in VisionBlockingLayerMarkers)
@@ -504,14 +535,20 @@ internal static class MapCollisionLoader
                     return LayerOpacity.VisionBlocking; // definitive → force bake, overrides any see-through hint
             }
 
-            foreach (var marker in SeeThroughLayerMarkers)
-            {
-                if (tag.Contains(marker, StringComparison.OrdinalIgnoreCase))
-                    seeThrough = true;
-            }
+            if (tag.Contains(WindowLayerMarker, StringComparison.OrdinalIgnoreCase))
+                window = true;
+            if (tag.Contains(PassBulletsLayerMarker, StringComparison.OrdinalIgnoreCase))
+                passBullets = true;
         }
 
-        return seeThrough ? LayerOpacity.SeeThrough : LayerOpacity.Unknown;
+        // window ⇒ transparent material (see-through at any thickness). passbullets ⇒ bullet-penetrable only,
+        // which is NOT a vision see-through signal unless the shape is also thin — reported separately so Emit
+        // can apply the thinness gate. Fail toward INCLUDE: an undecided set stays Unknown (surfaceprop fallback).
+        if (window)
+            return LayerOpacity.SeeThroughWindow;
+        if (passBullets)
+            return LayerOpacity.SeeThroughPassBullets;
+        return LayerOpacity.Unknown;
     }
 
     private static bool IsClipTagSet(IReadOnlyCollection<string> tags)
