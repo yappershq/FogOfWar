@@ -11,5 +11,29 @@
   "hideWeapons": true,
   "transmitChannel": 3,
   "debugStatus": false,
-  "extraSeeThroughProps": []
+  "extraSeeThroughProps": [],
+  "filterTeammates": false,
+  // OPT-IN-WITHIN-OPT-IN: smoke raw-reads CS2 process memory via the fixed offsets below and is the only
+  // non-fail-open feature. Ships DISABLED. Enable per CS2 build ONLY after re-verifying smokeOffsets, and pin
+  // smokeBinarySizeBytes / smokeBinaryCrc32 so a later build change auto-disables smoke instead of using stale offsets.
+  "smokeOcclusion": false,
+  // Re-copy the smoke density grid at most once every N game frames while smoke is active (1 = every frame).
+  "smokeCaptureIntervalFrames": 3,
+  // Expected libserver.so size / CRC-32 (hex) the offsets were verified against. 0 / "" = unset (smoke allowed but
+  // logs a loud "unverified" warning). When set and the loaded binary differs, smoke is disabled at Install.
+  "smokeBinarySizeBytes": 0,
+  "smokeBinaryCrc32": "",
+  "heClearRadiusUnits": 100,
+  "heClearSeconds": 2.5,
+  "smokeOffsets": {
+    "volume": 3504,
+    "center": 212,
+    "startTime": 12,
+    "storage": 112,
+    "frame": 236,
+    "storageMask": 8,
+    "storageDensity": 12296,
+    "storageFrameStride": 524288,
+    "storageCellStride": 16
+  }
 }

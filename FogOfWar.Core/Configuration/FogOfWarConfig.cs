@@ -105,6 +105,69 @@ public sealed class FogOfWarConfig
     /// </summary>
     [JsonPropertyName("extraSeeThroughProps")] public string[] ExtraSeeThroughProps { get; set; } = Array.Empty<string>();
 
+    /// <summary>
+    ///     Also cull SAME-TEAM pairs (T-vs-T, CT-vs-CT), not just enemies. Default <c>false</c>. The "both sides
+    ///     are a real playing team (never Spectator/None)" guard still applies. NOTE: the LOS worker and the
+    ///     game-thread apply widen this predicate INDEPENDENTLY and must agree — both read this one flag.
+    /// </summary>
+    [JsonPropertyName("filterTeammates")] public bool FilterTeammates { get; set; } = false;
+
+    /// <summary>
+    ///     Live CS2 smoke clouds occlude visibility (a captured smoke that provably blocks the sightline hides the
+    ///     enemy behind it). Default <c>false</c> — OPT-IN-WITHIN-OPT-IN. Smoke raw-reads CS2 process memory via
+    ///     fixed <see cref="SmokeOffsets" /> every frame on the game thread and is the <b>ONLY non-fail-open
+    ///     feature</b> (it can hide an otherwise-visible player); a CS2 update that shifts the smoke layout can turn
+    ///     a stale offset into a false-hide or a game-thread crash. An operator must therefore explicitly enable this
+    ///     per CS2 build AFTER re-verifying the offsets, and should pin <see cref="SmokeBinarySizeBytes" /> /
+    ///     <see cref="SmokeBinaryCrc32" /> so a later build change auto-disables smoke instead of reading stale
+    ///     offsets. Any capture/read failure still drops ALL smoke for that pass (fail-open guard).
+    /// </summary>
+    [JsonPropertyName("smokeOcclusion")] public bool SmokeOcclusion { get; set; } = false;
+
+    /// <summary>
+    ///     Throttle: re-copy the (expensive) 32,768-cell smoke density grid at most once every this many game
+    ///     frames while smoke is active; in-between frames reuse the last captured grid (the worker ages it forward
+    ///     so timing stays correct). Smoke evolves far slower than the 64Hz tick, so a small value cuts the
+    ///     per-frame game-thread copy cost with no visible change. Clamped to &gt;= 1 (1 = every frame). Default 3.
+    /// </summary>
+    [JsonPropertyName("smokeCaptureIntervalFrames")] public int SmokeCaptureIntervalFrames { get; set; } = 3;
+
+    /// <summary>
+    ///     Binary gate (paired with <see cref="SmokeBinaryCrc32" />): the expected byte size of the CS2 server
+    ///     binary (<c>libserver.so</c>) that the raw <see cref="SmokeOffsets" /> were verified against. When SET
+    ///     (&gt; 0) and the loaded binary's size does not match, smoke occlusion is DISABLED at Install (a CS2
+    ///     update shifted the layout → stale offsets would risk a false-hide / crash). Default 0 = unset (smoke is
+    ///     allowed but logs a loud "offsets unverified" warning). Pin this after re-verifying offsets for a build.
+    /// </summary>
+    [JsonPropertyName("smokeBinarySizeBytes")] public long SmokeBinarySizeBytes { get; set; } = 0;
+
+    /// <summary>
+    ///     Binary gate (paired with <see cref="SmokeBinarySizeBytes" />): the expected CRC-32 (hex, e.g.
+    ///     <c>"a1b2c3d4"</c>) of <c>libserver.so</c> the raw <see cref="SmokeOffsets" /> were verified against. When
+    ///     SET and the loaded binary's CRC does not match, smoke occlusion is DISABLED at Install. Hashed ONCE at
+    ///     Install (never per frame). Default empty = unset. Optional refinement over the cheaper size check.
+    /// </summary>
+    [JsonPropertyName("smokeBinaryCrc32")] public string SmokeBinaryCrc32 { get; set; } = string.Empty;
+
+    /// <summary>
+    ///     Radius (units) around an HE detonation within which the blast punches a temporary viewing channel
+    ///     through smoke. Default 100. Set &lt;= 0 to disable HE clearing.
+    /// </summary>
+    [JsonPropertyName("heClearRadiusUnits")] public float HeClearRadiusUnits { get; set; } = 100.0f;
+
+    /// <summary>
+    ///     How long (seconds) an HE detonation keeps its smoke channel open. Default 2.5. Set &lt;= 0 to disable.
+    /// </summary>
+    [JsonPropertyName("heClearSeconds")] public float HeClearSeconds { get; set; } = 2.5f;
+
+    /// <summary>
+    ///     Raw engine memory offsets used to read a smoke projectile's density grid (from CS2FOW's
+    ///     <c>cs2fow.games.txt</c>, verified against a specific CS2 build). Exposed in config so a CS2 update that
+    ///     shifts these can be hotfixed WITHOUT a rebuild. Validated at Install; if invalid, smoke occlusion is
+    ///     disabled (fail-open — the rest of FOW is unaffected).
+    /// </summary>
+    [JsonPropertyName("smokeOffsets")] public SmokeOffsets SmokeOffsets { get; set; } = new();
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -147,4 +210,58 @@ public sealed class FogOfWarConfig
             return new FogOfWarConfig();
         }
     }
+}
+
+/// <summary>
+///     Raw engine offsets for reading a <c>smokegrenade_projectile</c>'s smoke volume + density storage. Defaults
+///     are CS2FOW's Linux values (<c>cs2fow.games.txt</c>, verified against CS2 build 24209309). All are relative:
+///     <see cref="Volume" /> is added to the entity pointer; <see cref="Center" /> / <see cref="StartTime" /> /
+///     <see cref="Storage" /> / <see cref="Frame" /> are read from the volume; the <c>Storage*</c> offsets index
+///     into the storage block the <see cref="Storage" /> pointer points at.
+/// </summary>
+public sealed class SmokeOffsets
+{
+    /// <summary>Entity pointer → smoke volume (smoke_volume_offset_linux).</summary>
+    [JsonPropertyName("volume")] public int Volume { get; set; } = 3504;
+
+    /// <summary>Volume → cloud center Vector (smoke_center_offset).</summary>
+    [JsonPropertyName("center")] public int Center { get; set; } = 212;
+
+    /// <summary>Volume → start-time float (smoke_start_time_offset).</summary>
+    [JsonPropertyName("startTime")] public int StartTime { get; set; } = 12;
+
+    /// <summary>Volume → storage pointer (smoke_storage_offset).</summary>
+    [JsonPropertyName("storage")] public int Storage { get; set; } = 112;
+
+    /// <summary>Volume → active frame index 0/1 (smoke_frame_offset).</summary>
+    [JsonPropertyName("frame")] public int Frame { get; set; } = 236;
+
+    /// <summary>Storage → opaque-cell mask (4096 bytes) (k_smoke_storage_mask_offset).</summary>
+    [JsonPropertyName("storageMask")] public int StorageMask { get; set; } = 8;
+
+    /// <summary>Storage → density grid base (k_smoke_storage_density_offset = 0x3008).</summary>
+    [JsonPropertyName("storageDensity")] public int StorageDensity { get; set; } = 0x3008;
+
+    /// <summary>Per-frame stride within the density storage (k_smoke_storage_frame_stride = 0x80000).</summary>
+    [JsonPropertyName("storageFrameStride")] public long StorageFrameStride { get; set; } = 0x80000;
+
+    /// <summary>Per-cell stride within a density frame; the float lives at offset 0 (k_smoke_storage_cell_stride = 0x10).</summary>
+    [JsonPropertyName("storageCellStride")] public int StorageCellStride { get; set; } = 0x10;
+
+    /// <summary>
+    ///     Sanity-check the offsets before the module raw-reads with them. A garbage offset (e.g. a mangled config
+    ///     after a CS2 update) would otherwise walk arbitrary memory. Fields must be non-negative and within a
+    ///     generous cap; strides must be positive and the cell stride at least a float wide. Returns false ⇒ the
+    ///     module disables smoke occlusion (fail-open) rather than risk a bad read.
+    /// </summary>
+    public bool Validate()
+        => Volume is >= 0 and < 65536
+           && Center is >= 0 and < 65536
+           && StartTime is >= 0 and < 65536
+           && Storage is >= 0 and < 65536
+           && Frame is >= 0 and < 65536
+           && StorageMask is >= 0 and < 65536
+           && StorageDensity is >= 0 and < (1 << 24)
+           && StorageFrameStride is > 0 and < (1L << 28)
+           && StorageCellStride is >= 4 and < 4096;
 }

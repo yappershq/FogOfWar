@@ -128,6 +128,9 @@ internal static class LosSampler
         float           lookaheadSeconds,
         float           peekMargin,
         float           maxPredSpeed,
+        bool            filterTeammates,
+        SmokeSnapshot?  smoke,
+        float           ageAdvance,
         bool[]          blocked,
         byte[]?         lastClear = null)
     {
@@ -143,12 +146,13 @@ internal static class LosSampler
                     continue;
 
                 ref var ss = ref players[s];
-                if (!ss.Valid || !AreEnemies(rs.Team, ss.Team))
+                if (!ss.Valid || !ShouldCull(rs.Team, ss.Team, filterTeammates))
                     continue;
 
                 var pairIdx = (r * Slots) + s;
                 blocked[pairIdx] =
-                    PairBlocked(in rs, in ss, los, lookaheadSeconds, peekMargin, maxPredSpeed, lastClear, pairIdx);
+                    PairBlocked(in rs, in ss, los, lookaheadSeconds, peekMargin, maxPredSpeed, smoke, ageAdvance,
+                        lastClear, pairIdx);
             }
         }
     }
@@ -170,6 +174,9 @@ internal static class LosSampler
         float           lookaheadSeconds,
         float           peekMargin,
         float           maxPredSpeed,
+        bool            filterTeammates,
+        SmokeSnapshot?  smoke,
+        float           ageAdvance,
         bool[]          blocked,
         int             maxDegreeOfParallelism = -1)
     {
@@ -187,14 +194,14 @@ internal static class LosSampler
                 if (s == r)
                     continue;
 
-                if (!players[s].Valid || !AreEnemies(players[r].Team, players[s].Team))
+                if (!players[s].Valid || !ShouldCull(players[r].Team, players[s].Team, filterTeammates))
                     continue;
 
                 // No temporal-coherence cache here: a single shared hint buffer across parallel workers would
                 // race. The uncached path is boolean-identical (order-independent OR-of-clears).
                 blocked[(r * Slots) + s] =
                     PairBlocked(in players[r], in players[s], los, lookaheadSeconds, peekMargin, maxPredSpeed,
-                        null, (r * Slots) + s);
+                        smoke, ageAdvance, null, (r * Slots) + s);
             }
         });
     }
@@ -217,6 +224,8 @@ internal static class LosSampler
         float            lookaheadSeconds,
         float            peekMargin,
         float            maxPredSpeed,
+        SmokeSnapshot?   smoke,
+        float            ageAdvance,
         byte[]?          lastClear,
         int              pairIdx)
     {
@@ -407,14 +416,14 @@ internal static class LosSampler
             // when the world barely moved between passes. A stale / out-of-range hint (map change, or a conditional
             // group toggled so the ray count shrank) is simply skipped and the full sweep runs.
             int hint = lastClear[pairIdx];
-            if (hint < n && !los.IsBlocked(rayO[hint], rayT[hint]))
+            if (hint < n && RayClear(los, smoke, ageAdvance, rayO[hint], rayT[hint]))
                 return false; // still visible via the remembered ray — keep the hint
 
             for (var i = 0; i < n; i++)
             {
                 if (i == hint)
                     continue; // already tested above
-                if (!los.IsBlocked(rayO[i], rayT[i]))
+                if (RayClear(los, smoke, ageAdvance, rayO[i], rayT[i]))
                 {
                     lastClear[pairIdx] = (byte) i;
                     return false;
@@ -428,12 +437,25 @@ internal static class LosSampler
         // No temporal cache (e.g. ComputeMatrixParallel): plain in-order sweep. Boolean-identical.
         for (var i = 0; i < n; i++)
         {
-            if (!los.IsBlocked(rayO[i], rayT[i]))
+            if (RayClear(los, smoke, ageAdvance, rayO[i], rayT[i]))
                 return false;
         }
 
         return true;
     }
+
+    /// <summary>
+    ///     A ray is CLEAR when the static world does not block it AND the captured smoke (if any) does not block
+    ///     it either. This is the smoke-aware per-ray test — see <see cref="SmokeOcclusion.LineBlocked" />. The
+    ///     OR-of-clears sweep is unchanged: a pair is blocked only when EVERY ray fails this test.
+    ///
+    ///     <para><b>⚠️ Smoke makes this test the ONE non-fail-open path.</b> A smoke false-positive here hides an
+    ///     otherwise-visible player, so the capture side must feed <paramref name="smoke" /> only fully-validated,
+    ///     non-torn grids (it drops ALL smoke on any read failure). When <paramref name="smoke" /> is null the test
+    ///     collapses to the plain world-LOS check.</para>
+    /// </summary>
+    private static bool RayClear(LosQuery los, SmokeSnapshot? smoke, float ageAdvance, Vector3 o, Vector3 t)
+        => !los.IsBlocked(o, t) && (smoke is null || !SmokeOcclusion.LineBlocked(smoke, o, t, ageAdvance, los));
 
     /// <summary>
     ///     15 sample points on the NOW target AABB: 4 top corners, center, upper, all 4 bottom corners (both
@@ -508,7 +530,23 @@ internal static class LosSampler
         return new Vector3(vel.X * scale, vel.Y * scale, 0f);
     }
 
-    /// <summary>Strict T-vs-CT enemy test on raw team ints (2=T, 3=CT). Only these pairs are ever sampled.</summary>
-    private static bool AreEnemies(int a, int b)
-        => (a == TeamT && b == TeamCT) || (a == TeamCT && b == TeamT);
+    /// <summary>
+    ///     Pair-eligibility predicate on raw team ints (2=T, 3=CT). Both sides MUST be a real playing team (T or
+    ///     CT — never <c>UnAssigned</c> / <c>Spectator</c>). With <paramref name="filterTeammates" /> off (default)
+    ///     only strictly-opposing T-vs-CT pairs are sampled; with it on, same-team pairs (T-vs-T, CT-vs-CT) are
+    ///     sampled too.
+    ///
+    ///     <para><b>Must stay byte-identical to <c>FogOfWarModule.ShouldCull</c>.</b> The worker (this predicate)
+    ///     and the game-thread apply (that one) decide pair eligibility INDEPENDENTLY; if they ever disagree, pairs
+    ///     strobe (one hides, the other releases every frame).</para>
+    /// </summary>
+    private static bool ShouldCull(int a, int b, bool filterTeammates)
+    {
+        var aTeam = a == TeamT || a == TeamCT;
+        var bTeam = b == TeamT || b == TeamCT;
+        if (!aTeam || !bTeam)
+            return false;                // never Spectator / None / UnAssigned
+
+        return filterTeammates || a != b; // teammate mode: any T/CT pair; else strictly opposing
+    }
 }

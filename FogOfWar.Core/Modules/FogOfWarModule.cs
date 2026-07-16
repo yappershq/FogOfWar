@@ -7,10 +7,13 @@
 // worker snapshot and applies the transmit denial.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using FogOfWar.Configuration;
@@ -22,6 +25,7 @@ using Sharp.Shared.Listeners;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
+using Sharp.Shared.Utilities;
 using Vector3 = System.Numerics.Vector3;
 
 namespace FogOfWar;
@@ -66,9 +70,10 @@ namespace FogOfWar;
 ///     Only slot (0..63) and <see cref="EntityIndex" /> are stored; controllers / pawns / clients are
 ///     re-resolved live each frame and never cached across frames.</para>
 /// </summary>
-internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameListener
+internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameListener, IEventListener
 {
-    // IClientListener / IEntityListener / IGameListener all use ApiVersion 1 — one property serves all three.
+    // IClientListener / IEntityListener / IGameListener / IEventListener all use ApiVersion 1 — one property
+    // serves all four.
     public int ListenerVersion  => IClientListener.ApiVersion;
     public int ListenerPriority => 0;
 
@@ -104,6 +109,32 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
     private bool  _hideWeapons;
     private bool  _debugStatus;
 
+    // Feature 2 — teammate filtering. Cached at Install; read by BOTH the worker (LosSampler.ShouldCull) and the
+    // game-thread apply (ShouldCull below). Set once before the worker starts, never mutated → safe cross-thread.
+    private bool _filterTeammates;
+
+    // Feature 1 — smoke / HE occlusion. Active only when enabled && smokeOcclusion && the offsets validate && the
+    // m_bDidSmokeEffect schema field resolves. When inactive, smoke is never captured (zero cost) and Smoke is null.
+    private bool  _smokeActive;
+    private float _heClearRadiusUnits;
+    private float _heClearSeconds;
+    private int   _smkVolumeOffset;
+    private int   _smkCenterOffset;
+    private int   _smkStartTimeOffset;
+    private int   _smkStorageOffset;
+    private int   _smkFrameOffset;
+    private int   _smkStorageMaskOffset;
+    private int   _smkStorageDensityOffset;
+    private long  _smkStorageFrameStride;
+    private int   _smkStorageCellStride;
+    private int   _didSmokeEffectOffset; // resolved once via SchemaManager (CSmokeGrenadeProjectile.m_bDidSmokeEffect)
+
+    // Throttle (perf): re-copy the density grid at most once every _smokeCaptureIntervalFrames frames; the worker
+    // holds the last captured grid in between and ages it forward. _smokeHoldStaleMs bounds how long the worker may
+    // keep applying a held grid without a refresh (worker overload) before dropping it — smoke fail-opens past that.
+    private int _smokeCaptureIntervalFrames;
+    private int _smokeHoldStaleMs;
+
     // ── Per-frame snapshot (one per slot) — captured on the game thread ──────────────────────────────────
     private struct PawnSnap
     {
@@ -136,12 +167,28 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         public readonly int                        Tick;
         public readonly int                        Generation;
 
-        public WorkerInput(LosSampler.SampledPlayer[] players, int max, int tick, int generation)
+        // Smoke hand-off. <see cref="SmokeChanged" /> = true means this input carries a FRESHLY captured grid
+        // (<see cref="Smoke" />, possibly null when smoke cleared / capture failed) that the worker must ADOPT —
+        // returning any grid it previously held to the pool and taking ownership of this one. SmokeChanged = false
+        // (a throttle skip frame) means the worker keeps the grid it already holds. Because a fresh capture is
+        // published in EXACTLY ONE input, its pooled grids are taken by the worker XOR reclaimed by the game (the
+        // skipped-input path in PublishWorkerInput) — never both, so no double-return / torn read. CaptureMs is the
+        // wall-clock (Environment.TickCount64) of that capture; the worker ages the smoke forward by (now-CaptureMs).
+        public readonly SmokeSnapshot? Smoke;
+        public readonly bool           SmokeChanged;
+        public readonly long           CaptureMs;
+
+        public WorkerInput(
+            LosSampler.SampledPlayer[] players, int max, int tick, int generation,
+            SmokeSnapshot? smoke, bool smokeChanged, long captureMs)
         {
-            Players    = players;
-            Max        = max;
-            Tick       = tick;
-            Generation = generation;
+            Players      = players;
+            Max          = max;
+            Tick         = tick;
+            Generation   = generation;
+            Smoke        = smoke;
+            SmokeChanged = smokeChanged;
+            CaptureMs    = captureMs;
         }
     }
 
@@ -178,7 +225,7 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         }
     }
 
-    private WorkerInput? _input;    // volatile via Volatile.Read/Write
+    private WorkerInput? _input;    // game↔worker handoff via Interlocked.Exchange; nulled via Volatile.Write on teardown/map change
     private VisSnapshot? _vis;      // volatile via Volatile.Read/Write
     private LosState?    _losState; // volatile via Volatile.Read/Write — baked BVH + generation (null until ready)
 
@@ -200,6 +247,33 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
     private OpacityFilter _opacityFilter = new();
     private string        _bakeDir       = string.Empty;
     private int           _mapGeneration; // Interlocked/Volatile — invalidates a slow bake after a map change
+
+    // ── Smoke / HE occlusion state (game thread; the pools are cross-thread — see below) ─────────────────
+    // HE detonation ring (64 entries): raw (center, detonationTime) records written by the hegrenade_detonate
+    // event listener (game thread) and read by CaptureSmokes (game thread). Both on the game thread → no lock.
+    private readonly Vector3[] _heCenter         = new Vector3[SmokeOcclusion.MaxHeClearances];
+    private readonly float[]   _heDetonationTime = new float[SmokeOcclusion.MaxHeClearances];
+    private int                _heCount;
+    private int                _heNext;
+
+    // Reusable smoke grid buffers. Renting the float[32768] density grids fresh every capture would churn the
+    // Large Object Heap (128KB each) → frequent Gen2 GCs / frame hitches. Instead the game thread RENTS from these
+    // pools at capture and the WORKER PUSHES them back once it has advanced past the snapshot that borrowed them
+    // (it is the sole reader, so it returns only buffers it is provably done reading — no torn-read race). See
+    // WorkerLoop / CaptureSmokes / RentDensity / ReturnSmoke.
+    private readonly ConcurrentStack<byte[]>  _smokeOpaquePool  = new();
+    private readonly ConcurrentStack<float[]> _smokeDensityPool = new();
+
+    // Live smokegrenade_projectile entities (indices), maintained from OnEntityCreated/OnEntityDeleted so the
+    // per-frame CaptureSmokes enumeration is SKIPPED entirely when none exist (the overwhelmingly common case).
+    // A HashSet makes deletes idempotent (a recycled/missed index can't drift the count) and Count IS the live
+    // count. Game thread only (entity lifecycle callbacks + OnFrame all run there). Cleared on map change.
+    private readonly HashSet<EntityIndex> _smokeEntities = new();
+
+    // Throttle bookkeeping (game thread): frames until the next fresh density-grid capture, and whether we have a
+    // live smoke published to the worker (so a transition to no-smoke tells the worker to drop its held grid once).
+    private int  _smokeCaptureCountdown;
+    private bool _gameSmokePublished;
 
     // Weapon owner tracking: weapon entity index → owner controller index. Native auto-unhooks on deletion.
     private readonly Dictionary<EntityIndex, EntityIndex> _weaponOwner = new();
@@ -276,6 +350,67 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _hideWeapons  = cfg.HideWeapons;
         _debugStatus  = cfg.DebugStatus;
 
+        // Feature 2: teammate filtering (both the worker and the game-thread apply read this one flag).
+        _filterTeammates = cfg.FilterTeammates;
+
+        // Feature 1: smoke / HE occlusion. Cache the raw offsets and resolve the m_bDidSmokeEffect schema field so
+        // capture can filter to smokes that have actually puffed. Any of: feature off, invalid offsets, or an
+        // unresolved schema field ⇒ smoke stays inactive (fail-open — never captured, Smoke always null).
+        _heClearRadiusUnits = MathF.Max(0f, cfg.HeClearRadiusUnits);
+        _heClearSeconds     = MathF.Max(0f, cfg.HeClearSeconds);
+
+        _smokeCaptureIntervalFrames = Math.Max(1, cfg.SmokeCaptureIntervalFrames);
+        // Bound the worker's held-grid staleness: comfortably above the capture window so a normally-paced worker
+        // never trips it, but small enough that an overloaded worker fail-opens a stale grid within a fraction of a
+        // second instead of hiding a player who has since left the smoke.
+        _smokeHoldStaleMs = Math.Max(250, _smokeCaptureIntervalFrames * (1000 / TickRate) * 4);
+
+        var offsets = cfg.SmokeOffsets;
+        _smkVolumeOffset         = offsets.Volume;
+        _smkCenterOffset         = offsets.Center;
+        _smkStartTimeOffset      = offsets.StartTime;
+        _smkStorageOffset        = offsets.Storage;
+        _smkFrameOffset          = offsets.Frame;
+        _smkStorageMaskOffset    = offsets.StorageMask;
+        _smkStorageDensityOffset = offsets.StorageDensity;
+        _smkStorageFrameStride   = offsets.StorageFrameStride;
+        _smkStorageCellStride    = offsets.StorageCellStride;
+
+        _smokeActive = false;
+        if (cfg.SmokeOcclusion)
+        {
+            if (!offsets.Validate())
+            {
+                _logger.LogWarning(
+                    "[FogOfWar]: smokeOcclusion enabled but smokeOffsets failed validation — smoke occlusion "
+                    + "DISABLED (fail-open); fix configs/fogofwar.json smokeOffsets for the current CS2 build");
+            }
+            else
+            {
+                try
+                {
+                    // Schema-resolve the projectile "did the smoke effect fire yet" bool ONCE (robust across CS2
+                    // updates); the density grid itself is read via the fixed config offsets above.
+                    _didSmokeEffectOffset =
+                        _bridge.SchemaManager.GetNetVarOffset("CSmokeGrenadeProjectile", "m_bDidSmokeEffect");
+                    _smokeActive = true;
+                }
+                catch (Exception e)
+                {
+                    _logger.LogWarning(e,
+                        "[FogOfWar]: could not resolve CSmokeGrenadeProjectile::m_bDidSmokeEffect — smoke occlusion "
+                        + "DISABLED (fail-open)");
+                }
+            }
+        }
+
+        // Binary gate: smoke raw-reads memory via offsets verified against ONE CS2 build. If the loaded libserver.so
+        // no longer matches the pinned build, the layout may have shifted → stale offsets risk a false-hide or a
+        // game-thread crash. Verify once here (may flip _smokeActive off); unpinned builds are allowed with a loud
+        // warning. Runs before the event-listener install below so a disabled feature never hooks hegrenade_detonate.
+        if (_smokeActive)
+            VerifySmokeBinary(cfg);
+
         // lookahead_s = clamp(max(assumedRttMs + updateIntervalMs, minLookaheadMs), 0, maxLookaheadMs) / 1000.
         var raw = cfg.AssumedRttMs + cfg.UpdateIntervalMs;
         var clampedMs = Math.Clamp(Math.Max(raw, cfg.MinLookaheadMs), 0, Math.Max(cfg.MinLookaheadMs, cfg.MaxLookaheadMs));
@@ -295,6 +430,14 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
 
         // Game listener: OnServerActivate fires on every map start → (re)bake that map's BVH off-thread.
         _bridge.ModSharp.InstallGameListener(this);
+
+        // Event listener: only when smoke occlusion is active — hegrenade_detonate feeds the HE clearance ring that
+        // punches temporary channels through smoke. Re-HookEvent guarded on map activate (OnServerActivate).
+        if (_smokeActive)
+        {
+            _bridge.EventManager.InstallEventListener(this);
+            _bridge.EventManager.HookEvent("hegrenade_detonate");
+        }
 
         _frameHook = OnFrame;
         _bridge.ModSharp.InstallGameFrameHook(null, _frameHook);
@@ -342,10 +485,10 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _logger.LogInformation(
             "[FogOfWar] ACTIVE (DENIAL, not gated by detectionMode) — BVH worker oracle — "
             + "channel={Channel}, lookahead={Lookahead}ms, peekMargin={Peek}, maxPredSpeed={MaxSpeed}, hold={Hold}t, "
-            + "stale={Stale}t, workerInterval={Worker}ms, slowPass={Slow}t, hideWeapons={Weapons}, debug={Debug}, "
-            + "bakeDir={BakeDir}",
+            + "stale={Stale}t, workerInterval={Worker}ms, slowPass={Slow}t, hideWeapons={Weapons}, "
+            + "filterTeammates={Teammates}, smokeOcclusion={Smoke}, debug={Debug}, bakeDir={BakeDir}",
             _channel, clampedMs, _peekMargin, _maxPredSpeed, _holdTicks, _staleTicks, _workerIntervalMs, _slowTicks,
-            _hideWeapons, _debugStatus, _bakeDir);
+            _hideWeapons, _filterTeammates, _smokeActive, _debugStatus, _bakeDir);
     }
 
     public void Uninstall()
@@ -382,6 +525,10 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _bridge.ClientManager.RemoveClientListener(this);
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ModSharp.RemoveGameListener(this);
+
+        // Only installed when smoke was active (see Install). RemoveEventListener drops the hegrenade_detonate hook.
+        if (_smokeActive)
+            _bridge.EventManager.RemoveEventListener(this);
 
         // Cancel any pending manual-test auto-expire (force-calls EndManualTest → clears mode, re-asserts visible).
         if (_manualTestMode || _manualTestTimer != Guid.Empty)
@@ -427,6 +574,16 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _manualTestMode       = false;
         _manualForcedSender   = EntityIndex.InvalidIndex;
         _manualForcedReceiver = EntityIndex.InvalidIndex;
+
+        // Drop HE clearance history and release the smoke buffer pools (the immutable snapshots referencing any
+        // in-flight buffers are dropped with _input/_vis above; GC reclaims them).
+        _heCount = 0;
+        _heNext  = 0;
+        _smokeEntities.Clear();
+        _smokeCaptureCountdown = 0;
+        _gameSmokePublished    = false;
+        _smokeOpaquePool.Clear();
+        _smokeDensityPool.Clear();
     }
 
     // ── Game frame (post, game thread) ───────────────────────────────────────────────────────────────────
@@ -605,11 +762,470 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
             };
         }
 
+        // Capture live smoke on the game thread (only plain copied grids cross to the worker — never a live
+        // pointer). ANY capture/read failure ⇒ null: smoke is the one NON-fail-open feature, so a partial/torn grid
+        // must NEVER reach the worker (it would hide an otherwise-visible player).
+        //   Perf: (1) SKIP the whole enumeration when no smoke entity exists (_smokeEntities.Count, maintained from
+        // entity create/delete). (2) THROTTLE the expensive 32,768-cell grid copy to once every
+        // _smokeCaptureIntervalFrames frames — on the frames in between we publish SmokeChanged=false and the worker
+        // keeps the grid it holds (aged forward via CaptureMs). Only a fresh-capture input carries a non-null Smoke.
+        SmokeSnapshot? smoke        = null;
+        var            smokeChanged = false;
+        var            captureMs    = 0L;
+
+        if (_smokeActive && _smokeEntities.Count > 0)
+        {
+            if (--_smokeCaptureCountdown <= 0)
+            {
+                _smokeCaptureCountdown = _smokeCaptureIntervalFrames;
+                smoke                  = CaptureSmokes(max); // fresh pooled grids, or null (nothing puffed / torn read)
+                smokeChanged           = true;
+                captureMs              = Environment.TickCount64;
+                _gameSmokePublished    = smoke is not null;
+            }
+            // else: throttle skip frame → SmokeChanged stays false, worker keeps its held grid.
+        }
+        else if (_gameSmokePublished)
+        {
+            // Smoke just went away (no live clouds) → tell the worker to drop its held grid ONCE (Smoke = null).
+            smokeChanged           = true;
+            captureMs              = Environment.TickCount64;
+            _gameSmokePublished    = false;
+            _smokeCaptureCountdown = 0; // capture immediately when smoke returns
+        }
+
         // Stamp the current map generation so the worker never pairs these positions with a different map's BVH.
-        Volatile.Write(ref _input, new WorkerInput(players, max, now, Volatile.Read(ref _mapGeneration)));
+        var next = new WorkerInput(players, max, now, Volatile.Read(ref _mapGeneration), smoke, smokeChanged, captureMs);
+
+        // Publish atomically and reclaim a skipped input's grids. The worker TAKES inputs via Interlocked.Exchange
+        // to null, so a non-null return here is an input the worker never took — the game still owns its grids. Only
+        // a fresh-capture input carries a non-null Smoke, and each is published exactly once, so a snapshot is taken
+        // by the worker XOR reclaimed here — never both: no double-return, no return of a grid the worker is reading.
+        var skipped = Interlocked.Exchange(ref _input, next);
+        if (skipped?.Smoke is { } orphan && !ReferenceEquals(orphan, smoke))
+            ReturnSmoke(orphan);
     }
 
     private static Vector3 ToV3(Vector v) => new(v.X, v.Y, v.Z);
+
+    // ── Smoke / HE occlusion (game thread) ─────────────────────────────────────────────────────────────────
+    //
+    // ⚠️ NON-FAIL-OPEN FEATURE. Smoke HIDES an otherwise-visible player, so this is the ONE place a bug can cause
+    // a gameplay-breaking false-hide. The MANDATORY guard, enforced throughout: any read/validation failure ⇒ the
+    // whole pass gets NO smoke (return null — NEVER a partial or torn grid). All raw reads use the offsets that
+    // were validated at Install, on freshly enumerated entities; the torn-read guard (read frame, copy, re-read
+    // frame) rejects a grid captured mid engine-write.
+
+    private byte[]  RentOpaque()  => _smokeOpaquePool.TryPop(out var a) ? a : new byte[SmokeOcclusion.MaskBytes];
+    private float[] RentDensity() => _smokeDensityPool.TryPop(out var a) ? a : new float[SmokeOcclusion.CellCount];
+
+    // Called by the WORKER once it has advanced past a snapshot (it is the sole reader of the grids). Returns each
+    // volume's grids to the pools so the next game-thread capture can rent them instead of allocating LOH arrays.
+    private void ReturnSmoke(SmokeSnapshot smoke)
+    {
+        var volumes = smoke.Volumes;
+        for (var i = 0; i < volumes.Length; i++)
+        {
+            _smokeOpaquePool.Push(volumes[i].Opaque);
+            _smokeDensityPool.Push(volumes[i].Density);
+        }
+    }
+
+    /// <summary>
+    ///     Capture the currently-active smoke clouds + HE clearance channels into a plain immutable snapshot for the
+    ///     worker. Enumerates <c>smokegrenade_projectile</c> entities that have puffed (<c>m_bDidSmokeEffect</c>),
+    ///     raw-reads each one's density grid with the torn-read guard, and validates finiteness / age / frame.
+    ///
+    ///     <para><b>Returns null (drop ALL smoke) on ANY failure</b> — globals not ready, &gt;
+    ///     <see cref="SmokeOcclusion.MaxVolumes" /> clouds (overflow), a null storage pointer, a torn frame that
+    ///     never stabilises, or a non-finite value. This is the non-fail-open guard: a partial or torn grid must
+    ///     never reach the worker.</para>
+    /// </summary>
+    private SmokeSnapshot? CaptureSmokes(int max)
+    {
+        _ = max; // capture is per-server, not per-slot; kept for call-site symmetry with Snapshot/Publish.
+
+        float now;
+        try
+        {
+            now = _bridge.ModSharp.GetGlobals().CurTime;
+        }
+        catch
+        {
+            return null; // globals not ready (cold boot) → no smoke this pass
+        }
+
+        if (!float.IsFinite(now))
+            return null;
+
+        var entities = _bridge.EntityManager.GetAllEntitiesByClassname("smokegrenade_projectile");
+        if (entities.Length == 0)
+            return null; // common case: no smoke → zero further cost
+
+        // Collect the volume base pointers of smokes that have actually puffed. Overflow (> MaxVolumes) ⇒ drop ALL.
+        Span<nint> volumeBases = stackalloc nint[SmokeOcclusion.MaxVolumes];
+        var count = 0;
+        foreach (var entity in entities)
+        {
+            if (!entity.IsValid())
+                continue;
+
+            var ptr = entity.GetAbsPtr();
+            if (ptr == 0)
+                continue;
+
+            if (!ptr.GetBool(_didSmokeEffectOffset))
+                continue; // hasn't puffed yet → no density grid
+
+            if (count >= SmokeOcclusion.MaxVolumes)
+                return null; // overflow → drop ALL smoke (upstream behaviour)
+
+            volumeBases[count++] = ptr + _smkVolumeOffset;
+        }
+
+        if (count == 0)
+            return null;
+
+        var built  = new SmokeVolume[count];
+        var filled = 0;
+        for (var i = 0; i < count; i++)
+        {
+            var volume    = volumeBases[i];
+            var centerRaw = volume.GetVector(_smkCenterOffset);
+            var center    = new Vector3(centerRaw.X, centerRaw.Y, centerRaw.Z);
+            var startTime = volume.GetFloat(_smkStartTimeOffset);
+            var storage   = volume.GetObjectPtr(_smkStorageOffset);
+            var age       = now - startTime;
+
+            var opaque  = RentOpaque();
+            var density = RentDensity();
+
+            if (!TryCopyStableSmokeFrame(volume, storage, center, age, opaque, density))
+            {
+                // Read/validation failure → return this + every earlier rented grid, and DROP ALL smoke.
+                _smokeOpaquePool.Push(opaque);
+                _smokeDensityPool.Push(density);
+                for (var k = 0; k < filled; k++)
+                {
+                    _smokeOpaquePool.Push(built[k].Opaque);
+                    _smokeDensityPool.Push(built[k].Density);
+                }
+
+                return null;
+            }
+
+            built[i] = new SmokeVolume(center, age, startTime, opaque, density);
+            filled++;
+        }
+
+        var heClearances = CaptureHeClearances(now);
+        return new SmokeSnapshot(built, heClearances, _heClearRadiusUnits, _heClearSeconds);
+    }
+
+    // Torn-read guard (upstream copy_stable_smoke_frame): read the active frame, copy the grid, re-read the frame;
+    // if it changed the engine wrote mid-copy → retry once, else fail (→ drop ALL smoke).
+    private bool TryCopyStableSmokeFrame(nint volume, nint storage, Vector3 center, float age, byte[] opaque, float[] density)
+    {
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var frame = volume.GetInt32(_smkFrameOffset);
+            if (!TryCopySmokeFrame(storage, frame, center, age, opaque, density))
+                return false;
+            if (frame == volume.GetInt32(_smkFrameOffset))
+                return true;
+        }
+
+        return false;
+    }
+
+    // Upstream copy_smoke_frame: validate storage/frame/center/age, copy the 4096-byte opaque mask, then the
+    // strided density grid for this frame — rejecting any non-finite density value.
+    private bool TryCopySmokeFrame(nint storage, int frame, Vector3 center, float age, byte[] opaque, float[] density)
+    {
+        if (storage == 0 || (frame != 0 && frame != 1)
+            || !float.IsFinite(center.X) || !float.IsFinite(center.Y) || !float.IsFinite(center.Z)
+            || !float.IsFinite(age) || age < -0.25f || age > 30.0f)
+            return false;
+
+        // Opaque cell mask (frame-independent).
+        Marshal.Copy(storage + _smkStorageMaskOffset, opaque, 0, SmokeOcclusion.MaskBytes);
+
+        // Density grid for the active frame; each cell's float lives at the start of its StorageCellStride slot.
+        var densityBase = storage + _smkStorageDensityOffset + (nint) (frame * _smkStorageFrameStride);
+        for (var index = 0; index < SmokeOcclusion.CellCount; index++)
+        {
+            var value = densityBase.GetFloat(index * _smkStorageCellStride);
+            if (!float.IsFinite(value))
+                return false;
+            density[index] = value;
+        }
+
+        return true;
+    }
+
+    // Snapshot the HE clearance ring: each recorded detonation still within its clear window becomes an active
+    // channel (center, age this pass, detonation time). Game thread only (written by FireGameEvent, read here).
+    private HeClearance[] CaptureHeClearances(float now)
+    {
+        if (_heClearRadiusUnits <= 0f || _heClearSeconds <= 0f || _heCount == 0)
+            return Array.Empty<HeClearance>();
+
+        // Pre-scan: skip the allocation entirely when NO recorded detonation is still in its clear window (the
+        // common case once the ring has aged out) — an active-smoke frame with no live HE channel then costs nothing.
+        var anyInWindow = false;
+        for (var i = 0; i < _heCount; i++)
+        {
+            var age = now - _heDetonationTime[i];
+            if (age >= 0f && age < _heClearSeconds)
+            {
+                anyInWindow = true;
+                break;
+            }
+        }
+
+        if (!anyInWindow)
+            return Array.Empty<HeClearance>();
+
+        var tmp = new HeClearance[_heCount];
+        var n   = 0;
+        for (var i = 0; i < _heCount; i++)
+        {
+            var detonationTime = _heDetonationTime[i];
+            var age            = now - detonationTime;
+            if (age >= 0f && age < _heClearSeconds)
+                tmp[n++] = new HeClearance(_heCenter[i], age, detonationTime);
+        }
+
+        if (n == 0)
+            return Array.Empty<HeClearance>();
+        if (n == tmp.Length)
+            return tmp;
+
+        var trimmed = new HeClearance[n];
+        Array.Copy(tmp, trimmed, n);
+        return trimmed;
+    }
+
+    // Record an HE detonation into the 64-entry ring (game thread; rejects non-finite center/time — NaN-default).
+    private void RecordHeDetonation(Vector3 center, float detonationTime)
+    {
+        if (!float.IsFinite(center.X) || !float.IsFinite(center.Y) || !float.IsFinite(center.Z)
+            || !float.IsFinite(detonationTime))
+            return;
+
+        _heCenter[_heNext]         = center;
+        _heDetonationTime[_heNext] = detonationTime;
+        _heNext                    = (_heNext + 1) % SmokeOcclusion.MaxHeClearances;
+        _heCount                   = Math.Min(_heCount + 1, SmokeOcclusion.MaxHeClearances);
+    }
+
+    // ── Smoke binary gate (Install only) ──────────────────────────────────────────────────────────────────
+    // Smoke reads CS2 memory via offsets verified against ONE libserver.so build. Verify the loaded binary still
+    // matches the pinned build (size and/or CRC-32); on mismatch DISABLE smoke (offsets may be stale → false-hide /
+    // crash risk). When nothing is pinned, allow smoke but warn LOUDLY that the offsets are unverified. Called once
+    // at Install (may set _smokeActive=false); the CRC is hashed at most once here, never per frame.
+    private void VerifySmokeBinary(FogOfWarConfig cfg)
+    {
+        var expectSize = cfg.SmokeBinarySizeBytes;
+        var haveCrc    = TryParseCrc32(cfg.SmokeBinaryCrc32, out var expectCrc);
+        if (!haveCrc && !string.IsNullOrWhiteSpace(cfg.SmokeBinaryCrc32))
+            _logger.LogWarning(
+                "[FogOfWar]: smokeBinaryCrc32 '{Value}' is not a valid hex CRC-32 — ignoring it", cfg.SmokeBinaryCrc32);
+        var pinned = expectSize > 0 || haveCrc;
+
+        var path = LocateServerBinary();
+        if (path is null)
+        {
+            if (pinned)
+            {
+                _smokeActive = false;
+                _logger.LogError(
+                    "[FogOfWar]: smoke occlusion DISABLED — a verified server build is pinned "
+                    + "(smokeBinarySizeBytes/smokeBinaryCrc32) but libserver.so could not be located to verify it. "
+                    + "Smoke raw-reads CS2 memory via fixed offsets; refusing to read against an unverifiable binary.");
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "[FogOfWar]: smoke occlusion is ENABLED but its raw memory offsets are UNVERIFIED against this "
+                    + "CS2 build (nothing pinned, and libserver.so was not located). A CS2 update can shift the smoke "
+                    + "layout and cause a false-hide or a server crash — re-verify smokeOffsets and pin the build's "
+                    + "size/crc after EVERY CS2 update.");
+            }
+
+            return;
+        }
+
+        long actualSize;
+        try
+        {
+            actualSize = new FileInfo(path).Length;
+        }
+        catch (Exception e)
+        {
+            if (pinned)
+            {
+                _smokeActive = false;
+                _logger.LogError(e,
+                    "[FogOfWar]: smoke occlusion DISABLED — could not read libserver.so '{Path}' to verify the "
+                    + "pinned build", path);
+            }
+            else
+            {
+                _logger.LogWarning(e,
+                    "[FogOfWar]: smoke occlusion ENABLED but libserver.so '{Path}' could not be read — offsets "
+                    + "remain UNVERIFIED against this CS2 build", path);
+            }
+
+            return;
+        }
+
+        if (!pinned)
+        {
+            _logger.LogWarning(
+                "[FogOfWar]: smoke occlusion is ENABLED but UNVERIFIED against this CS2 build — the current "
+                + "libserver.so is {Size} bytes. Pin \"smokeBinarySizeBytes\": {Size} (and a \"smokeBinaryCrc32\") "
+                + "after re-verifying smokeOffsets, so a future CS2 update that shifts the smoke layout auto-disables "
+                + "smoke instead of risking a false-hide or crash.", actualSize, actualSize);
+
+            return;
+        }
+
+        var  sizeOk    = expectSize <= 0 || actualSize == expectSize;
+        var  crcOk     = true;
+        uint actualCrc = 0;
+        if (haveCrc)
+            crcOk = TryCrc32File(path, out actualCrc) && actualCrc == expectCrc;
+
+        if (sizeOk && crcOk)
+        {
+            _logger.LogInformation(
+                "[FogOfWar]: smoke binary gate PASSED — libserver.so matches the pinned build "
+                + "(size={Size} bytes, crc={Crc})",
+                actualSize, haveCrc ? actualCrc.ToString("x8") : "unset");
+
+            return;
+        }
+
+        _smokeActive = false;
+        _logger.LogError(
+            "[FogOfWar]: smoke occlusion DISABLED — the server binary CHANGED since the smoke offsets were verified. "
+            + "libserver.so is size={ActualSize} crc={ActualCrc}; pinned size={ExpectSize} crc={ExpectCrc}. The raw "
+            + "offsets may no longer match this CS2 build (false-hide / crash risk) — re-verify smokeOffsets for the "
+            + "new build then update smokeBinarySizeBytes/smokeBinaryCrc32.",
+            actualSize, haveCrc ? actualCrc.ToString("x8") : "unset",
+            expectSize, haveCrc ? expectCrc.ToString("x8") : "unset");
+    }
+
+    // Locate the loaded CS2 dedicated-server binary. GetGamePath() returns the game root (contains csgo/) or the
+    // csgo/ content dir directly, so probe both layouts. Returns null when it cannot be found (→ "cannot verify").
+    private string? LocateServerBinary()
+    {
+        string gamePath;
+        try
+        {
+            gamePath = _bridge.ModSharp.GetGamePath();
+        }
+        catch
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(gamePath))
+            return null;
+
+        var candidates = new[]
+        {
+            Path.Combine(gamePath, "csgo", "bin", "linuxsteamrt64", "libserver.so"),
+            Path.Combine(gamePath, "bin", "linuxsteamrt64", "libserver.so"),
+        };
+
+        return Array.Find(candidates, File.Exists);
+    }
+
+    // Parse a hex CRC-32 (optional 0x prefix; matches the bake log's crc={Crc:x8} format an operator would copy).
+    // Empty / whitespace / unparseable ⇒ false (unset).
+    private static bool TryParseCrc32(string? text, out uint crc)
+    {
+        crc = 0;
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+
+        var s = text.Trim();
+        if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            s = s[2..];
+
+        return uint.TryParse(s, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out crc);
+    }
+
+    private static readonly uint[] Crc32Table = BuildCrc32Table();
+
+    private static uint[] BuildCrc32Table()
+    {
+        var table = new uint[256];
+        for (uint n = 0; n < 256; n++)
+        {
+            var c = n;
+            for (var k = 0; k < 8; k++)
+                c = (c & 1) != 0 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[n] = c;
+        }
+
+        return table;
+    }
+
+    // Standard CRC-32/IEEE (zlib) over the whole file, streamed in 64KB chunks. Returns false on any I/O error.
+    private static bool TryCrc32File(string path, out uint crc)
+    {
+        crc = 0;
+        try
+        {
+            var c      = 0xFFFFFFFFu;
+            var buffer = new byte[1 << 16];
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            int read;
+            while ((read = fs.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                for (var i = 0; i < read; i++)
+                    c = Crc32Table[(c ^ buffer[i]) & 0xFF] ^ (c >> 8);
+            }
+
+            crc = c ^ 0xFFFFFFFFu;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    // ── IEventListener (game thread) — HE detonation feeds the smoke-clearance ring ───────────────────────
+    public void FireGameEvent(IGameEvent @event)
+    {
+        if (!_installed || !_smokeActive)
+            return;
+        if (!@event.GetName().Equals("hegrenade_detonate", StringComparison.Ordinal))
+            return;
+
+        // center = event x/y/z (NaN default → RecordHeDetonation rejects a missing/garbage field).
+        var center = new Vector3(
+            @event.GetFloat("x", float.NaN),
+            @event.GetFloat("y", float.NaN),
+            @event.GetFloat("z", float.NaN));
+
+        float now;
+        try
+        {
+            now = _bridge.ModSharp.GetGlobals().CurTime;
+        }
+        catch
+        {
+            return;
+        }
+
+        RecordHeDetonation(center, now);
+    }
 
     // ── Background worker: recompute the full visibility matrix off the game thread ──────────────────────
     private void WorkerLoop(WorkerHandle h)
@@ -626,13 +1242,44 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         var lastClear    = new byte[Slots * Slots];
         var lastCacheGen = -1;
 
+        // The smoke grid this worker currently HOLDS (owns). It is adopted from a fresh-capture input and kept
+        // across throttle skip frames, then returned to the pool when a newer capture is adopted or it goes stale.
+        // The worker is the sole reader of its held grid, so it returns buffers only after it is provably done with
+        // them (no torn read on the game thread's next rent). heldCaptureMs is when that grid was captured.
+        SmokeSnapshot? heldSmoke     = null;
+        var            heldCaptureMs = 0L;
+
         while (!h.Stop)
         {
             sw.Restart();
 
-            var input = Volatile.Read(ref _input);
+            // Take the latest input EXCLUSIVELY (null ⇒ nothing new since the last take). Exclusive ownership is
+            // what lets the game thread reclaim the grids of an input the worker never took (see PublishWorkerInput).
+            var input = Interlocked.Exchange(ref _input, null);
             var los   = Volatile.Read(ref _losState); // atomic (BVH + generation) pair — never torn across a map change
             var gen   = Volatile.Read(ref _mapGeneration);
+
+            if (input is not null)
+            {
+                // Adopt a freshly-captured grid (returning the previously-held one to the pool), or keep the held
+                // grid on a throttle skip frame (SmokeChanged=false). Sole-owner return → no double-return.
+                if (input.SmokeChanged)
+                {
+                    if (heldSmoke is not null && !ReferenceEquals(heldSmoke, input.Smoke))
+                        ReturnSmoke(heldSmoke);
+                    heldSmoke     = input.Smoke;
+                    heldCaptureMs = input.CaptureMs;
+                }
+
+                // Drop a held grid that has gone stale (an overloaded worker holding an old capture): smoke is the
+                // one non-fail-open feature, so an over-aged grid must fail OPEN (no occlusion) rather than keep
+                // hiding a player who may since have left it.
+                if (heldSmoke is not null && Environment.TickCount64 - heldCaptureMs > _smokeHoldStaleMs)
+                {
+                    ReturnSmoke(heldSmoke);
+                    heldSmoke = null;
+                }
+            }
 
             // Only compute when the positions, the geometry AND the current map generation all agree — refuse to
             // pair old-map positions (stale _input) with the new map's BVH, which would produce a garbage matrix
@@ -650,10 +1297,17 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
 
                 try
                 {
+                    // Age the held smoke forward from its capture → now (throttling + worker lag mean the pass runs
+                    // several ms after capture; this keeps the age ramp / HE-clearance timing correct).
+                    var ageAdvance = heldSmoke is null
+                        ? 0f
+                        : MathF.Max(0f, (Environment.TickCount64 - heldCaptureMs) / 1000f);
+
                     var blocked = new bool[Slots * Slots];
                     LosSampler.ComputeMatrix(
                         input.Players, input.Max, los.Query,
-                        _lookaheadSeconds, _peekMargin, _maxPredSpeed, blocked, lastClear);
+                        _lookaheadSeconds, _peekMargin, _maxPredSpeed,
+                        _filterTeammates, heldSmoke, ageAdvance, blocked, lastClear);
                     Volatile.Write(ref _vis, new VisSnapshot(blocked, input.Tick, los.Generation));
 
                     Volatile.Write(ref _workerLastMicros, sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency);
@@ -708,6 +1362,16 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _lastThrowLogTick = 0;
         Array.Clear(_revealedUntil);
         Array.Clear(_pushedHidden);
+
+        // Drop HE detonations from the previous map (their positions + CurTime no longer apply).
+        _heCount = 0;
+        _heNext  = 0;
+
+        // The old map's smoke entities are destroyed; reset the live-smoke tracking + throttle so the new map starts
+        // from "no smoke" and captures immediately once a cloud appears.
+        _smokeEntities.Clear();
+        _smokeCaptureCountdown = 0;
+        _gameSmokePublished    = false;
 
         // Drop stale "we hooked this controller" ownership beliefs: on a map change the old controllers are
         // destroyed (native auto-unhooks) and the same slots are reused for fresh controllers a co-resident
@@ -936,10 +1600,11 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 var idx = (r * Slots) + sSlot;
                 ref var ss = ref _snap[sSlot];
 
-                // Per-push re-validation (§1.2): only a live human receiver vs a live STRICTLY-OPPOSING (T-vs-CT)
-                // sender is ever a hide candidate. Everything else (dead / spectating / same team / None /
-                // Spectator team / bot receiver / missing snapshot) FORCES VISIBLE.
-                var candidate = receiverOk && ss.Valid && AreEnemies(rs.Team, ss.Team);
+                // Per-push re-validation (§1.2): only a live human receiver vs a live eligible sender is ever a
+                // hide candidate. Eligibility = both real playing teams; strictly-opposing by default, or any
+                // T/CT pair when filterTeammates is on (ShouldCull — MUST match the worker's predicate). Everything
+                // else (dead / spectating / None / Spectator team / bot receiver / missing snapshot) FORCES VISIBLE.
+                var candidate = receiverOk && ss.Valid && ShouldCull(rs.Team, ss.Team);
 
                 bool desiredHide;
                 if (!candidate || visStale)
@@ -1119,11 +1784,23 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         => Math.Max(1, (int) MathF.Round(ms / 1000f * TickRate));
 
     /// <summary>
-    ///     Strict T-vs-CT enemy test. A bare <c>rs.Team != ss.Team</c> would let an <c>UnAssigned</c> /
-    ///     <c>Spectator</c> pawn become a hide candidate; only Terrorist-vs-CT (either direction) may ever hide.
+    ///     Pair-eligibility test. Both sides must be a real playing team (<c>TE</c>/<c>CT</c> — never
+    ///     <c>UnAssigned</c>/<c>Spectator</c>). By default only strictly-opposing T-vs-CT pairs are hide
+    ///     candidates; with <see cref="_filterTeammates" /> on, same-team pairs (T-vs-T, CT-vs-CT) are too.
+    ///
+    ///     <para><b>Must stay byte-identical to <see cref="LosSampler" />'s <c>ShouldCull</c>.</b> The worker and
+    ///     this apply decide eligibility INDEPENDENTLY; if they disagree a pair strobes. <c>CStrikeTeam.TE</c>==2
+    ///     and <c>CT</c>==3 match the raw ints the sampler compares.</para>
     /// </summary>
-    private static bool AreEnemies(CStrikeTeam a, CStrikeTeam b)
-        => (a == CStrikeTeam.TE && b == CStrikeTeam.CT) || (a == CStrikeTeam.CT && b == CStrikeTeam.TE);
+    private bool ShouldCull(CStrikeTeam a, CStrikeTeam b)
+    {
+        var aTeam = a is CStrikeTeam.TE or CStrikeTeam.CT;
+        var bTeam = b is CStrikeTeam.TE or CStrikeTeam.CT;
+        if (!aTeam || !bTeam)
+            return false;                     // never Spectator / None / UnAssigned
+
+        return _filterTeammates || a != b;    // teammate mode: any T/CT pair; else strictly opposing
+    }
 
     private void EnsureHooked(IPlayerController controller)
     {
@@ -1205,6 +1882,11 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
     {
         if (!_installed)
             return;
+
+        // Re-hook the HE event as a guard against the hook being dropped across a map change (the listener itself
+        // stays installed from Install). KickBake below clears the now-stale HE ring.
+        if (_smokeActive)
+            _bridge.EventManager.HookEvent("hegrenade_detonate");
 
         KickBake(_bridge.ModSharp.GetGlobals().MapName);
     }
@@ -1403,10 +2085,23 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
     }
 
     // ── IEntityListener (game thread) ─────────────────────────────────────────────────────────────────────
+    // Track live smokegrenade_projectile entities so CaptureSmokes is skipped when none exist (perf). Classname is
+    // only safe to read on a valid entity (it crashes otherwise), and a freshly-created entity IS valid — so we
+    // read it here and remember the index; the delete path below removes BY INDEX (no classname read on a
+    // being-deleted entity). Gated on _smokeActive so it costs nothing when smoke occlusion is off.
+    public void OnEntityCreated(IBaseEntity entity)
+    {
+        if (!_installed || !_smokeActive)
+            return;
+
+        if (entity.IsValid() && entity.Classname.Equals("smokegrenade_projectile", StringComparison.Ordinal))
+            _smokeEntities.Add(entity.Index);
+    }
+
     // Evict a deleted weapon's tracking immediately so a recycled entity index can never make the weapon
     // gone-path (ReconcileWeapons) push SetEntityOwner(widx, Invalid) onto a FOREIGN hook. Fires for every
-    // entity deletion, so it stays cheap (three hash removes on a usually-absent key). Native auto-unhooks the
-    // deleted entity, so no RemoveEntityHooks is needed here.
+    // entity deletion, so it stays cheap (hash removes on a usually-absent key). Native auto-unhooks the
+    // deleted entity, so no RemoveEntityHooks is needed here. Also un-tracks a live smoke by index (idempotent).
     public void OnEntityDeleted(IBaseEntity entity)
     {
         if (!_installed)
@@ -1417,5 +2112,6 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         _weaponSeen.Remove(idx);
         _weaponUnseenFrames.Remove(idx);
         _weHookedWeapons.Remove(idx);
+        _smokeEntities.Remove(idx);
     }
 }

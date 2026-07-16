@@ -22,6 +22,11 @@ internal sealed class InterfaceBridge
     internal IEntityManager   EntityManager   { get; }
     internal IClientManager   ClientManager   { get; }
 
+    // Smoke / HE occlusion: EventManager delivers hegrenade_detonate; SchemaManager resolves the smoke projectile's
+    // m_bDidSmokeEffect field offset (the raw density-grid reads use fixed config offsets, not schema).
+    internal IEventManager  EventManager  { get; }
+    internal ISchemaManager SchemaManager { get; }
+
     // Resolved in OnAllModulesLoaded (optional — only the fow_test admin gate uses it).
     internal IAdminManager? AdminManager { get; private set; }
 
@@ -34,6 +39,8 @@ internal sealed class InterfaceBridge
         TransmitManager = sharedSystem.GetTransmitManager();
         EntityManager   = sharedSystem.GetEntityManager();
         ClientManager   = sharedSystem.GetClientManager();
+        EventManager    = sharedSystem.GetEventManager();
+        SchemaManager   = sharedSystem.GetSchemaManager();
     }
 
     internal void ResolveModules()
