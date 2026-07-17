@@ -1,6 +1,10 @@
 {
   "enabled": true,
   "updateIntervalMs": 15,
+  // Off-thread matrix parallelism. 1 = serial. On a busy 32–64 player server raise this (e.g. 3–4) to cut matrix
+  // latency — receiver rows compute in parallel, result unchanged. Clamped to CPU count; keep MODEST on a box that
+  // hosts many servers. Only the OFF-thread worker is affected; the game thread's per-tick cost is unchanged.
+  "maxComputeThreads": 4,
   // Peek-prediction lookahead is now PER-CLIENT and latency-aware: effective = clamp(minLookaheadMs + ping*
   // rttLookaheadScale, 0, maxLookaheadMs). Real per-client ping (m_iPing) drives the RTT term, so a high-ping
   // peeker leads further (matches what that client sees). minLookaheadMs = the 0-ping base (covers worker cadence).

@@ -253,14 +253,18 @@ internal static class LosSampler
     }
 
     /// <summary>
-    ///     Parallel <see cref="ComputeMatrix" />. The enemy-pair matrix is embarrassingly parallel — each
-    ///     receiver row writes a disjoint slice of <paramref name="blocked" /> (<c>r*Slots + s</c>), and
-    ///     <see cref="PairBlocked" /> only reads the immutable <paramref name="los" /> + stack-local scratch —
-    ///     so partitioning the receiver rows across worker threads is race-free.
+    ///     Parallel <see cref="ComputeMatrix" /> for high player counts (32–64 slots). The enemy-pair matrix is
+    ///     embarrassingly parallel — each receiver row <c>r</c> writes ONLY its own disjoint slice of
+    ///     <paramref name="blocked" /> (<c>r*Slots + s</c>) AND its own disjoint slice of the optional
+    ///     <paramref name="lastClear" /> hint buffer (<c>r*Slots .. r*Slots+Slots-1</c> — exactly one 64-byte line
+    ///     per row), and <see cref="PairBlocked" /> only reads the immutable <paramref name="los" /> + stack-local
+    ///     scratch. So the temporal-coherence cache IS race-free under partitioning (no two rows ever touch the same
+    ///     hint index), and the result is boolean-identical to the serial <see cref="ComputeMatrix" /> — order of
+    ///     evaluation does not affect any cell.
     ///
     ///     <para><paramref name="maxDegreeOfParallelism" /> ≤ 0 uses the scheduler default
-    ///     (<see cref="Environment.ProcessorCount" />). The result is identical to the serial
-    ///     <see cref="ComputeMatrix" /> — order of evaluation does not affect any cell.</para>
+    ///     (<see cref="Environment.ProcessorCount" />). On a co-tenant game host, CAP it (2–4) so a 64-player burst
+    ///     never starves the game thread or neighbouring servers.</para>
     /// </summary>
     public static void ComputeMatrixParallel(
         SampledPlayer[]   players,
@@ -271,6 +275,7 @@ internal static class LosSampler
         SmokeSnapshot?    smoke,
         float             ageAdvance,
         bool[]            blocked,
+        byte[]?           lastClear              = null,
         int               maxDegreeOfParallelism = -1)
     {
         var options = new ParallelOptions();
@@ -282,9 +287,9 @@ internal static class LosSampler
             if (!players[r].Valid || !players[r].Human)
                 return;
 
-            // Precompute the receiver-only origins ONCE for this row. Each row's slice of `blocked` is disjoint, so
-            // a per-row `lastClear` cache would in fact be race-free (each row touches only its own 64-byte line);
-            // this variant still runs cacheless for simplicity — the worker uses the serial cached path.
+            // Precompute the receiver-only origins ONCE for this row. lastClear (if given) is safe to use here: row r
+            // touches only hint indices r*Slots..r*Slots+Slots-1 — disjoint from every other row — so there is no
+            // cross-thread write to the same index.
             var geom = BuildReceiverGeom(in players[r], los, in tuning);
 
             for (var s = 0; s < max; s++)
@@ -296,7 +301,7 @@ internal static class LosSampler
                     continue;
 
                 blocked[(r * Slots) + s] =
-                    PairBlocked(in geom, in players[s], los, smoke, ageAdvance, null, (r * Slots) + s);
+                    PairBlocked(in geom, in players[s], los, smoke, ageAdvance, lastClear, (r * Slots) + s);
             }
         });
     }

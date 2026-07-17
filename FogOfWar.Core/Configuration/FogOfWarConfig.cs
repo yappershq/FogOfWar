@@ -40,6 +40,17 @@ public sealed class FogOfWarConfig
     [JsonPropertyName("updateIntervalMs")] public int UpdateIntervalMs { get; set; } = 15;
 
     /// <summary>
+    ///     Off-thread visibility-matrix parallelism: the max worker threads the background compute may fan across at
+    ///     high player counts (≥ ~12 players). <c>1</c> = serial (default — no extra threads). The matrix is O(pairs),
+    ///     so on a busy 32–64 player server raising this (e.g. 3–4) cuts matrix latency by computing receiver rows in
+    ///     parallel — each row is an independent, disjoint slice, so the temporal-coherence cache and the boolean
+    ///     result are unchanged. Clamped to the box's CPU count. Keep it MODEST on a co-tenant host (many servers per
+    ///     box): a 64-player burst across every core would starve the game thread / neighbours. ONLY the off-thread
+    ///     compute is affected — the game thread is never parallelised, so its per-tick cost is unchanged.
+    /// </summary>
+    [JsonPropertyName("maxComputeThreads")] public int MaxComputeThreads { get; set; } = 1;
+
+    /// <summary>
     ///     BASE peek-prediction lookahead (ms) — the window a 0-ping observer gets. Covers the off-thread worker's
     ///     recompute cadence + snapshot age. The effective per-client window is <c>base + ping·rttLookaheadScale</c>,
     ///     capped at <see cref="MaxLookaheadMs" />. Default 180.

@@ -101,6 +101,11 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
     private int   _channel;
     private LosSampler.SamplerTuning _tuning;         // latency-aware sampler tuning (per-client RTT scales lookahead + shoulders)
     private float _assumedRttSeconds; // 0-ping fallback RTT (mid-connect / before m_iPing populates)
+    private int   _maxComputeThreads; // off-thread matrix DOP cap (1 = serial); parallel above ParallelMinSlots players
+
+    // Below this player-slot high-water the matrix stays serial (Parallel.For partition overhead isn't worth it for
+    // small games); at/above it (≈6v6+) a populated server fans the compute across _maxComputeThreads.
+    private const int ParallelMinSlots = 12;
     private float _peekMargin;
     private float _maxPredSpeed;
     private int   _holdTicks;
@@ -434,6 +439,10 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
             shoulderRttScale:     MathF.Max(0f, cfg.ShoulderRttScale),
             maxShoulderUnits:     MathF.Max(0f, cfg.MaxShoulderUnits));
 
+        // Off-thread matrix parallelism (DOP cap). 1 ⇒ always serial. Clamp to the box's core count so a misconfig
+        // can't oversubscribe; on a co-tenant host keep this modest (a 64-player burst shouldn't grab every core).
+        _maxComputeThreads = Math.Clamp(cfg.MaxComputeThreads, 1, Environment.ProcessorCount);
+
         // Union the built-in see-through set with any operator-supplied surfaceprops (a custom map's translucent
         // material that would otherwise bake as an occluder → a false-hide). The bake logs the top included
         // surface-props so a live false-hide is diagnosable and the offending name can be added to config.
@@ -504,11 +513,11 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
             "[FogOfWar] ACTIVE (DENIAL, not gated by detectionMode) — BVH worker oracle — "
             + "channel={Channel}, lookahead={Base}-{Cap}ms (RTT-scaled ×{RttScale}), shoulder={ShBase}-{ShMax}u, "
             + "peekMargin={Peek}, maxPredSpeed={MaxSpeed}, hold={Hold}t, stale={Stale}t, workerInterval={Worker}ms, "
-            + "slowPass={Slow}t, hideWeapons={Weapons}, filterTeammates={Teammates}, smokeOcclusion={Smoke}, "
-            + "debug={Debug}, bakeDir={BakeDir}",
+            + "computeThreads={Threads}, slowPass={Slow}t, hideWeapons={Weapons}, filterTeammates={Teammates}, "
+            + "smokeOcclusion={Smoke}, debug={Debug}, bakeDir={BakeDir}",
             _channel, baseLookaheadMs, capLookaheadMs, cfg.RttLookaheadScale, cfg.ShoulderBaseUnits,
-            cfg.MaxShoulderUnits, _peekMargin, _maxPredSpeed, _holdTicks, _staleTicks, _workerIntervalMs, _slowTicks,
-            _hideWeapons, _filterTeammates, _smokeActive, _debugStatus, _bakeDir);
+            cfg.MaxShoulderUnits, _peekMargin, _maxPredSpeed, _holdTicks, _staleTicks, _workerIntervalMs,
+            _maxComputeThreads, _slowTicks, _hideWeapons, _filterTeammates, _smokeActive, _debugStatus, _bakeDir);
     }
 
     public void Uninstall()
@@ -1336,9 +1345,21 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                         : MathF.Max(0f, (Environment.TickCount64 - heldCaptureMs) / 1000f);
 
                     var blocked = new bool[Slots * Slots];
-                    LosSampler.ComputeMatrix(
-                        input.Players, input.Max, los.Query,
-                        in _tuning, _filterTeammates, heldSmoke, ageAdvance, blocked, lastClear);
+
+                    // Off-thread compute. At high player counts (32–64) the O(pairs) matrix is heavy for one core, so
+                    // fan it across a capped pool of threads — each receiver row is an independent, disjoint slice of
+                    // `blocked`/`lastClear`, so the temporal cache is kept and the result is boolean-identical. Small
+                    // games stay serial (Parallel.For overhead isn't worth it). The DOP cap (maxComputeThreads) keeps
+                    // a burst from starving the game thread or co-tenant servers on the same box.
+                    if (_maxComputeThreads > 1 && input.Max >= ParallelMinSlots)
+                        LosSampler.ComputeMatrixParallel(
+                            input.Players, input.Max, los.Query, _tuning, _filterTeammates, heldSmoke, ageAdvance,
+                            blocked, lastClear, _maxComputeThreads);
+                    else
+                        LosSampler.ComputeMatrix(
+                            input.Players, input.Max, los.Query,
+                            in _tuning, _filterTeammates, heldSmoke, ageAdvance, blocked, lastClear);
+
                     Volatile.Write(ref _vis, new VisSnapshot(blocked, input.Tick, los.Generation));
 
                     Volatile.Write(ref _workerLastMicros, sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency);
