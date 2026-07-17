@@ -99,7 +99,8 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
 
     // ── Cached config (read once at Install so the hot path never re-reads config props) ─────────────────
     private int   _channel;
-    private float _lookaheadSeconds; // constant per config (no per-client RTT exposed).
+    private LosSampler.SamplerTuning _tuning;         // latency-aware sampler tuning (per-client RTT scales lookahead + shoulders)
+    private float _assumedRttSeconds; // 0-ping fallback RTT (mid-connect / before m_iPing populates)
     private float _peekMargin;
     private float _maxPredSpeed;
     private int   _holdTicks;
@@ -147,6 +148,8 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         public Vector      Velocity;
         public Vector      Mins;      // local collision mins
         public Vector      Maxs;      // local collision maxs
+        public float       Yaw;       // observer eye yaw (degrees) — RTT-scaled shoulder origins
+        public float       Rtt;       // observer round-trip time (seconds, from m_iPing) — scales lookahead + shoulders
         public EntityIndex CtrlIndex; // controller entity index (== slot + 1)
     }
 
@@ -411,10 +414,24 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         if (_smokeActive)
             VerifySmokeBinary(cfg);
 
-        // lookahead_s = clamp(max(assumedRttMs + updateIntervalMs, minLookaheadMs), 0, maxLookaheadMs) / 1000.
-        var raw = cfg.AssumedRttMs + cfg.UpdateIntervalMs;
-        var clampedMs = Math.Clamp(Math.Max(raw, cfg.MinLookaheadMs), 0, Math.Max(cfg.MinLookaheadMs, cfg.MaxLookaheadMs));
-        _lookaheadSeconds = clampedMs / 1000f;
+        // Latency-aware lookahead + shoulder tuning. Per-client effective lookahead = clamp(baseMs + pingMs·scale,
+        // 0, capMs)/1000 — real per-client ping (m_iPing) drives the RTT term, so a high-ping peeker leads further
+        // (matching what that client sees). MinLookaheadMs is the 0-ping base (covers our off-thread worker cadence);
+        // MaxLookaheadMs the cap. AssumedRttMs is now only the fallback ping while m_iPing is still 0 (mid-connect).
+        var baseLookaheadMs = Math.Max(0, cfg.MinLookaheadMs);
+        // maxLookaheadMs <= 0 is an explicit "no prediction" sentinel (EffectiveLookahead returns 0) — do NOT floor
+        // it up to the base, or the disable would silently leave prediction active at the base window.
+        var capLookaheadMs  = cfg.MaxLookaheadMs <= 0 ? 0 : Math.Max(baseLookaheadMs, cfg.MaxLookaheadMs);
+        _assumedRttSeconds  = Math.Max(0, cfg.AssumedRttMs) / 1000f;
+        _tuning = new LosSampler.SamplerTuning(
+            baseLookaheadSeconds: baseLookaheadMs / 1000f,
+            rttLookaheadScale:    MathF.Max(0f, cfg.RttLookaheadScale),
+            maxLookaheadSeconds:  capLookaheadMs / 1000f,
+            peekMargin:           _peekMargin,
+            maxPredSpeed:         _maxPredSpeed,
+            shoulderBaseUnits:    MathF.Max(0f, cfg.ShoulderBaseUnits),
+            shoulderRttScale:     MathF.Max(0f, cfg.ShoulderRttScale),
+            maxShoulderUnits:     MathF.Max(0f, cfg.MaxShoulderUnits));
 
         // Union the built-in see-through set with any operator-supplied surfaceprops (a custom map's translucent
         // material that would otherwise bake as an occluder → a false-hide). The bake logs the top included
@@ -484,10 +501,12 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
 
         _logger.LogInformation(
             "[FogOfWar] ACTIVE (DENIAL, not gated by detectionMode) — BVH worker oracle — "
-            + "channel={Channel}, lookahead={Lookahead}ms, peekMargin={Peek}, maxPredSpeed={MaxSpeed}, hold={Hold}t, "
-            + "stale={Stale}t, workerInterval={Worker}ms, slowPass={Slow}t, hideWeapons={Weapons}, "
-            + "filterTeammates={Teammates}, smokeOcclusion={Smoke}, debug={Debug}, bakeDir={BakeDir}",
-            _channel, clampedMs, _peekMargin, _maxPredSpeed, _holdTicks, _staleTicks, _workerIntervalMs, _slowTicks,
+            + "channel={Channel}, lookahead={Base}-{Cap}ms (RTT-scaled ×{RttScale}), shoulder={ShBase}-{ShMax}u, "
+            + "peekMargin={Peek}, maxPredSpeed={MaxSpeed}, hold={Hold}t, stale={Stale}t, workerInterval={Worker}ms, "
+            + "slowPass={Slow}t, hideWeapons={Weapons}, filterTeammates={Teammates}, smokeOcclusion={Smoke}, "
+            + "debug={Debug}, bakeDir={BakeDir}",
+            _channel, baseLookaheadMs, capLookaheadMs, cfg.RttLookaheadScale, cfg.ShoulderBaseUnits,
+            cfg.MaxShoulderUnits, _peekMargin, _maxPredSpeed, _holdTicks, _staleTicks, _workerIntervalMs, _slowTicks,
             _hideWeapons, _filterTeammates, _smokeActive, _debugStatus, _bakeDir);
     }
 
@@ -728,6 +747,12 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 Velocity  = pawn.GetAbsVelocity(),
                 Mins      = mins,
                 Maxs      = maxs,
+                // Yaw feeds the shoulder-peek right vector; ping (ms → s) scales this receiver's lookahead + shoulder
+                // width. While m_iPing is still 0 (mid-connect) fall back to the configured assumed RTT.
+                Yaw       = pawn.GetEyeAngles().Y,
+                Rtt       = controller.GetNetVar<uint>("m_iPing") is var ping && ping > 0
+                                ? ping / 1000f
+                                : _assumedRttSeconds,
                 CtrlIndex = ctrlIndex,
             };
         }
@@ -759,6 +784,8 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 Velocity = ToV3(s.Velocity),
                 Mins     = ToV3(s.Mins),
                 Maxs     = ToV3(s.Maxs),
+                Yaw      = s.Yaw,
+                Rtt      = s.Rtt,
             };
         }
 
@@ -1306,8 +1333,7 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                     var blocked = new bool[Slots * Slots];
                     LosSampler.ComputeMatrix(
                         input.Players, input.Max, los.Query,
-                        _lookaheadSeconds, _peekMargin, _maxPredSpeed,
-                        _filterTeammates, heldSmoke, ageAdvance, blocked, lastClear);
+                        in _tuning, _filterTeammates, heldSmoke, ageAdvance, blocked, lastClear);
                     Volatile.Write(ref _vis, new VisSnapshot(blocked, input.Tick, los.Generation));
 
                     Volatile.Write(ref _workerLastMicros, sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency);

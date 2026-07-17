@@ -20,6 +20,9 @@ namespace FogOfWar.Engine;
 ///       <item>o3 — vertical peek-predicted eye (jump / drop-off; A5: vertical-only fallback) — samples all 8
 ///             shared points (A8), when used.</item>
 ///       <item>o4 — un-crouch eye (A7, ducked observer) — samples the 8 shared points, when used.</item>
+///       <item>o5..o8 — RTT-scaled left/right shoulder peeks (upstream shoulder origins) off the real eye AND the
+///             peek-predicted eye — each samples the 8 shared points; a shoulder that collapses onto its base eye
+///             (offset 0, or reverted through a wall by safe_origin) is skipped as a duplicate.</item>
 ///       <item>A3 — future-box leading corners (target strafing) — sampled from o1, when the box travels clear.
 ///             The NOW-box points are NEVER relocated (that relocation was the false-hide bug).</item>
 ///       <item>A6 — vertical-predicted corners (target jumping / falling) — sampled from o1 AND o2, when the
@@ -63,10 +66,16 @@ internal static class LosSampler
     private const int A3FutureCorners   = 8; // 4 top + 4 bottom corners of the predicted future box (from o1)
     private const int A6VerticalCorners = 4; // 4 XY corners at the predicted rising/falling Z (from o1 AND o2)
 
-    // Worst-case ray count (stackalloc scratch): o1×15 + o2×12 + o3×8 + o4×8 + A3×8 + A6×(4×2) = 59. Always
-    // < 255, so a byte temporal-coherence hint index is never ambiguous with NoClearHint (0xFF).
+    // RTT-scaled shoulder origins (upstream "left/right shoulder" model): o5/o6 = eye ± lateral, o7/o8 = the
+    // peek-predicted eye ± lateral. Each samples the 8 shared points. Additive → fail-open (safe_origin reverts a
+    // shoulder that would peek from inside geometry back to its base eye; duplicates are skipped).
+    private const int ShoulderOrigins = 4;
+
+    // Worst-case ray count (stackalloc scratch): o1×15 + o2×12 + o3×8 + o4×8 + 4 shoulders×8 + A3×8 + A6×(4×2)
+    // = 91. Always < 255, so a byte temporal-coherence hint index is never ambiguous with NoClearHint (0xFF).
     private const int MaxRays =
-        StaticPoints + O2Points + SharedPoints /*o3*/ + SharedPoints /*o4*/ + A3FutureCorners + (A6VerticalCorners * 2);
+        StaticPoints + O2Points + SharedPoints /*o3*/ + SharedPoints /*o4*/ + (ShoulderOrigins * SharedPoints)
+        + A3FutureCorners + (A6VerticalCorners * 2);
 
     // Temporal-coherence hint sentinel: "no ray is remembered as last-clearing this pair" (pair fully blocked, or
     // never sampled). Any value >= the pass's ray count is treated as absent, so 0xFF is always out of range.
@@ -85,6 +94,12 @@ internal static class LosSampler
     // ducked observer has velocity ≈ 0 (o2/o3 never fire), so this is the ONLY lookahead an un-crouch peek gets.
     // Added as an extra origin o4 (never relocates o1) → fail-open like the rest.
     private const float UnCrouchEyeRise = 18.0f;
+
+    // Shoulder-peek geometry (RTT-scaled origins). DegToRad builds the eye's right vector from the observer yaw;
+    // a shoulder that lands within SamePointEpsSq of its base eye (offset clamped to 0, or reverted through a wall)
+    // is a pure duplicate and skipped. SamePointEpsSq == upstream k_same_point_epsilon_sq.
+    private const float DegToRad       = 0.017453292519943295f;
+    private const float SamePointEpsSq = 1.0e-4f;
 
     // CS2 team numbering (Sharp.Shared.Enums.CStrikeTeam: TE=2, CT=3). The engine stays ModSharp-free by
     // comparing the raw int the module copies in via (int)team — only strictly-opposing T-vs-CT pairs sample.
@@ -106,6 +121,72 @@ internal static class LosSampler
         public Vector3 Velocity;
         public Vector3 Mins;     // local collision mins
         public Vector3 Maxs;     // local collision maxs
+        public float   Yaw;      // observer eye yaw (degrees) — builds the RTT-scaled shoulder origins
+        public float   Rtt;      // observer round-trip time (seconds, from m_iPing) — scales lookahead + shoulder width
+    }
+
+    /// <summary>
+    ///     Latency-aware sampling tuning (upstream <c>visibility_tuning</c>). Effective per-receiver lookahead grows
+    ///     with the receiver's RTT (a high-ping peeker leads further, matching what that client actually sees), and
+    ///     the lateral shoulder-peek origins widen with RTT too. All in the receiver's frame — the whole pair
+    ///     computation for receiver R uses R's RTT. Prediction is still additive (o1 baseline immovable), so any
+    ///     lookahead / shoulder value only ever converts hidden→visible — never a false-hide.
+    /// </summary>
+    internal readonly struct SamplerTuning
+    {
+        public readonly float BaseLookaheadSeconds; // lookahead at 0 ping (upstream base_lookahead_ms/1000 = 0.075)
+        public readonly float RttLookaheadScale;    // ms of extra lookahead per ms of RTT (ratio on rtt_ms; upstream 1.5)
+        public readonly float MaxLookaheadSeconds;  // hard cap (upstream max_lookahead_ms/1000 = 0.375); 0 ⇒ no prediction
+        public readonly float PeekMargin;           // minimum predicted-step length (units)
+        public readonly float MaxPredSpeed;         // prediction speed cap (units/s)
+        public readonly float ShoulderBaseUnits;    // shoulder offset at 0 ping (upstream 24); 0 ⇒ shoulders off
+        public readonly float ShoulderRttScale;     // shoulder units per ms of RTT (upstream 0.64)
+        public readonly float MaxShoulderUnits;     // shoulder offset cap (upstream 128)
+
+        public SamplerTuning(
+            float baseLookaheadSeconds, float rttLookaheadScale, float maxLookaheadSeconds, float peekMargin,
+            float maxPredSpeed, float shoulderBaseUnits, float shoulderRttScale, float maxShoulderUnits)
+        {
+            BaseLookaheadSeconds = baseLookaheadSeconds;
+            RttLookaheadScale    = rttLookaheadScale;
+            MaxLookaheadSeconds  = maxLookaheadSeconds;
+            PeekMargin           = peekMargin;
+            MaxPredSpeed         = maxPredSpeed;
+            ShoulderBaseUnits    = shoulderBaseUnits;
+            ShoulderRttScale     = shoulderRttScale;
+            MaxShoulderUnits     = maxShoulderUnits;
+        }
+    }
+
+    /// <summary>
+    ///     upstream <c>visibility_effective_lookahead_seconds</c>: the receiver's effective lookahead grows linearly
+    ///     with its RTT — <c>base_ms + rtt_ms · scale</c>, clamped to <c>[0, max_ms]</c>. A <c>MaxLookaheadSeconds</c>
+    ///     of 0 disables prediction entirely.
+    /// </summary>
+    public static float EffectiveLookahead(float rttSeconds, in SamplerTuning t)
+    {
+        if (t.MaxLookaheadSeconds <= 0f)
+            return 0f;
+        var rttMs    = MathF.Max(0f, rttSeconds) * 1000f;
+        var wantedMs = (t.BaseLookaheadSeconds * 1000f) + (rttMs * MathF.Max(0f, t.RttLookaheadScale));
+        return Math.Clamp(wantedMs, 0f, t.MaxLookaheadSeconds * 1000f) / 1000f;
+    }
+
+    /// <summary>
+    ///     upstream <c>visibility_shoulder_offset_units</c>: lateral shoulder-peek offset in units, scaling from
+    ///     <c>ShoulderBaseUnits</c> at 0 ping up to <c>MaxShoulderUnits</c> with RTT. Every player gets at least the
+    ///     base offset (a static ±base shoulder peek even at 0 ping); a base of 0 turns shoulders off.
+    /// </summary>
+    public static float ShoulderOffset(float rttSeconds, in SamplerTuning t)
+    {
+        // A base of 0 turns shoulder origins OFF entirely (the documented off-switch) — otherwise the RTT term
+        // would keep them active for any pinged player. Non-zero base guarantees at least ±base even at 0 ping.
+        if (t.ShoulderBaseUnits <= 0f)
+            return 0f;
+        var baseU   = t.ShoulderBaseUnits;
+        var maxU    = MathF.Max(baseU, t.MaxShoulderUnits);
+        var wanted  = MathF.Max(0f, rttSeconds) * 1000f * MathF.Max(0f, t.ShoulderRttScale);
+        return Math.Clamp(wanted, baseU, maxU);
     }
 
     /// <summary>
@@ -122,17 +203,15 @@ internal static class LosSampler
     ///     change.</para>
     /// </summary>
     public static void ComputeMatrix(
-        SampledPlayer[] players,
-        int             max,
-        LosQuery        los,
-        float           lookaheadSeconds,
-        float           peekMargin,
-        float           maxPredSpeed,
-        bool            filterTeammates,
-        SmokeSnapshot?  smoke,
-        float           ageAdvance,
-        bool[]          blocked,
-        byte[]?         lastClear = null)
+        SampledPlayer[]   players,
+        int               max,
+        LosQuery          los,
+        in SamplerTuning  tuning,
+        bool              filterTeammates,
+        SmokeSnapshot?    smoke,
+        float             ageAdvance,
+        bool[]            blocked,
+        byte[]?           lastClear = null)
     {
         for (var r = 0; r < max; r++)
         {
@@ -151,8 +230,7 @@ internal static class LosSampler
 
                 var pairIdx = (r * Slots) + s;
                 blocked[pairIdx] =
-                    PairBlocked(in rs, in ss, los, lookaheadSeconds, peekMargin, maxPredSpeed, smoke, ageAdvance,
-                        lastClear, pairIdx);
+                    PairBlocked(in rs, in ss, los, in tuning, smoke, ageAdvance, lastClear, pairIdx);
             }
         }
     }
@@ -168,17 +246,15 @@ internal static class LosSampler
     ///     <see cref="ComputeMatrix" /> — order of evaluation does not affect any cell.</para>
     /// </summary>
     public static void ComputeMatrixParallel(
-        SampledPlayer[] players,
-        int             max,
-        LosQuery        los,
-        float           lookaheadSeconds,
-        float           peekMargin,
-        float           maxPredSpeed,
-        bool            filterTeammates,
-        SmokeSnapshot?  smoke,
-        float           ageAdvance,
-        bool[]          blocked,
-        int             maxDegreeOfParallelism = -1)
+        SampledPlayer[]   players,
+        int               max,
+        LosQuery          los,
+        SamplerTuning     tuning,
+        bool              filterTeammates,
+        SmokeSnapshot?    smoke,
+        float             ageAdvance,
+        bool[]            blocked,
+        int               maxDegreeOfParallelism = -1)
     {
         var options = new ParallelOptions();
         if (maxDegreeOfParallelism > 0)
@@ -200,8 +276,8 @@ internal static class LosSampler
                 // No temporal-coherence cache here: a single shared hint buffer across parallel workers would
                 // race. The uncached path is boolean-identical (order-independent OR-of-clears).
                 blocked[(r * Slots) + s] =
-                    PairBlocked(in players[r], in players[s], los, lookaheadSeconds, peekMargin, maxPredSpeed,
-                        smoke, ageAdvance, null, (r * Slots) + s);
+                    PairBlocked(in players[r], in players[s], los, in tuning, smoke, ageAdvance, null,
+                        (r * Slots) + s);
             }
         });
     }
@@ -221,14 +297,19 @@ internal static class LosSampler
         in SampledPlayer rs,
         in SampledPlayer ss,
         LosQuery         los,
-        float            lookaheadSeconds,
-        float            peekMargin,
-        float            maxPredSpeed,
+        in SamplerTuning tuning,
         SmokeSnapshot?   smoke,
         float            ageAdvance,
         byte[]?          lastClear,
         int              pairIdx)
     {
+        // Effective lookahead scales with the RECEIVER's RTT — a high-ping observer predicts further, matching what
+        // that client actually sees when it peeks. Additive prediction (o1 immovable), so a larger lookahead only
+        // ever converts hidden→visible. peekMargin / maxPredSpeed come from the same tuning.
+        var lookaheadSeconds = EffectiveLookahead(rs.Rtt, tuning);
+        var peekMargin       = tuning.PeekMargin;
+        var maxPredSpeed     = tuning.MaxPredSpeed;
+
         // ── Observer origins ──────────────────────────────────────────────────────────────────────────────
         // o1 = real eye (the immovable baseline). o2 = horizontally peek-predicted eye.
         var o1      = rs.Eye;
@@ -284,6 +365,26 @@ internal static class LosSampler
         {
             o4    = o1 + new Vector3(0f, 0f, UnCrouchEyeRise);
             useO4 = !los.IsBlocked(o1, o4);
+        }
+
+        // o5..o8 = RTT-scaled shoulder-peek eyes (upstream left/right shoulder origins). The lateral offset is the
+        // eye's right vector × ShoulderOffset(rtt): every observer gets at least ±ShoulderBase (a static shoulder
+        // peek even at 0 ping), widening to ±MaxShoulder at high ping. o5/o6 flank the real eye; o7/o8 flank the
+        // horizontally-peek-predicted eye (o2). SafeOrigin reverts a shoulder that would peek from inside geometry
+        // back to its base, and a shoulder equal to its base is skipped at assembly — so these are pure additive,
+        // fail-open origins (they can only add clear-ray chances, never hide a visible pair).
+        var shoulderOff = ShoulderOffset(rs.Rtt, in tuning);
+        var o5 = o1; // left  shoulder (real eye)
+        var o6 = o1; // right shoulder (real eye)
+        var o7 = o2; // left  shoulder (predicted eye)
+        var o8 = o2; // right shoulder (predicted eye)
+        if (shoulderOff > 0f) // shoulders disabled (base 0) → skip the SafeOrigin BVH queries entirely
+        {
+            var shoulder = EyeRight(rs.Yaw) * shoulderOff;
+            o5 = SafeOrigin(los, o1, o1 - shoulder);
+            o6 = SafeOrigin(los, o1, o1 + shoulder);
+            o7 = SafeOrigin(los, o2, o2 - shoulder);
+            o8 = SafeOrigin(los, o2, o2 + shoulder);
         }
 
         // ── Target AABB (NOW box) — the box is NEVER relocated; the merge only ADDS points (A3) ──────────────
@@ -379,6 +480,13 @@ internal static class LosSampler
                 n++;
             }
         }
+
+        // (4b) o5..o8 RTT-scaled shoulder eyes → 8 shared points each. A shoulder that collapsed onto its base eye
+        // (offset 0, or reverted through a wall) is a pure duplicate of an origin already swept, so it is skipped.
+        n = AppendSharedRays(o5, o1, staticPts, rayO, rayT, n);
+        n = AppendSharedRays(o6, o1, staticPts, rayO, rayT, n);
+        n = AppendSharedRays(o7, o2, staticPts, rayO, rayT, n);
+        n = AppendSharedRays(o8, o2, staticPts, rayO, rayT, n);
 
         // (5) A3 future-box leading corners → o1, when the box travels unobstructed.
         if (useFutureCorners)
@@ -528,6 +636,47 @@ internal static class LosSampler
         var dist   = MathF.Max(capped * s, peekMargin);
         var scale  = dist / speed;
         return new Vector3(vel.X * scale, vel.Y * scale, 0f);
+    }
+
+    /// <summary>The eye's right vector (unit, XY plane) from the observer yaw — upstream <c>eye_right</c>.</summary>
+    private static Vector3 EyeRight(float yawDegrees)
+    {
+        var yaw = yawDegrees * DegToRad;
+        return new Vector3(MathF.Sin(yaw), -MathF.Cos(yaw), 0f);
+    }
+
+    /// <summary>
+    ///     upstream <c>safe_origin</c>: never peek from inside geometry. If the shoulder candidate is blocked from
+    ///     its base eye (or coincident with it), fall back to the base eye. Keeps every shoulder origin additive.
+    /// </summary>
+    private static Vector3 SafeOrigin(LosQuery los, Vector3 baseEye, Vector3 candidate)
+        => los.IsBlocked(baseEye, candidate) ? baseEye : candidate;
+
+    /// <summary>Two points within upstream <c>k_same_point_epsilon_sq</c> (used to skip a shoulder that is a duplicate).</summary>
+    private static bool Same(Vector3 a, Vector3 b)
+    {
+        var dx = a.X - b.X;
+        var dy = a.Y - b.Y;
+        var dz = a.Z - b.Z;
+        return ((dx * dx) + (dy * dy) + (dz * dz)) <= SamePointEpsSq;
+    }
+
+    /// <summary>
+    ///     Append the 8 shared target-point rays from <paramref name="origin" /> — unless it collapsed onto
+    ///     <paramref name="baseEye" /> (a pure duplicate of an origin already in the sweep). Returns the new count.
+    /// </summary>
+    private static int AppendSharedRays(
+        Vector3 origin, Vector3 baseEye, ReadOnlySpan<Vector3> staticPts, Span<Vector3> rayO, Span<Vector3> rayT, int n)
+    {
+        if (Same(origin, baseEye))
+            return n;
+        for (var i = 0; i < SharedPoints; i++)
+        {
+            rayO[n] = origin;
+            rayT[n] = staticPts[i];
+            n++;
+        }
+        return n;
     }
 
     /// <summary>

@@ -39,19 +39,49 @@ public sealed class FogOfWarConfig
     /// </summary>
     [JsonPropertyName("updateIntervalMs")] public int UpdateIntervalMs { get; set; } = 15;
 
-    /// <summary>Lower clamp (ms) on the peek-prediction lookahead window. Default 180.</summary>
+    /// <summary>
+    ///     BASE peek-prediction lookahead (ms) — the window a 0-ping observer gets. Covers the off-thread worker's
+    ///     recompute cadence + snapshot age. The effective per-client window is <c>base + ping·rttLookaheadScale</c>,
+    ///     capped at <see cref="MaxLookaheadMs" />. Default 180.
+    /// </summary>
     [JsonPropertyName("minLookaheadMs")] public int MinLookaheadMs { get; set; } = 180;
 
-    /// <summary>Upper clamp (ms) on the peek-prediction lookahead window. Default 250.</summary>
-    [JsonPropertyName("maxLookaheadMs")] public int MaxLookaheadMs { get; set; } = 250;
+    /// <summary>
+    ///     Upper clamp (ms) on the per-client lookahead window (base + RTT term). Default 375 (upstream cap). Set to
+    ///     0 to disable peek prediction entirely (falls back to o1 baseline + shoulder origins only).
+    /// </summary>
+    [JsonPropertyName("maxLookaheadMs")] public int MaxLookaheadMs { get; set; } = 375;
 
     /// <summary>
-    ///     Stand-in for per-client RTT (ModSharp exposes no per-client latency). Added to
-    ///     <see cref="UpdateIntervalMs" /> to form the raw lookahead before clamping. Default 60; with the
-    ///     default 30ms interval the raw 90ms is lifted to the 180ms <see cref="MinLookaheadMs" /> floor →
-    ///     effective default lookahead 180ms. Raise on high-ping populations to widen the reveal margin.
+    ///     Extra lookahead per second of the observer's real RTT (from <c>m_iPing</c>): effective lookahead =
+    ///     clamp(<see cref="MinLookaheadMs" /> + pingMs·scale, 0, <see cref="MaxLookaheadMs" />). Upstream
+    ///     <c>rtt_lookahead_scale</c> = 1.5 (a 100ms peeker gets +150ms lead). 0 disables RTT scaling (flat base).
+    /// </summary>
+    [JsonPropertyName("rttLookaheadScale")] public float RttLookaheadScale { get; set; } = 1.5f;
+
+    /// <summary>
+    ///     Fallback RTT (ms) used only while a client's <c>m_iPing</c> is still 0 (the brief mid-connect window);
+    ///     once real ping populates it is used instead. Default 60. (Formerly the fixed per-client RTT stand-in —
+    ///     real per-client ping now drives the lookahead + shoulder scaling.)
     /// </summary>
     [JsonPropertyName("assumedRttMs")] public int AssumedRttMs { get; set; } = 60;
+
+    /// <summary>
+    ///     Lateral shoulder-peek origin offset (units) at 0 ping — every observer samples a static ±this shoulder
+    ///     peek so a corner-hugging enemy is revealed. Widens with RTT up to <see cref="MaxShoulderUnits" />.
+    ///     Upstream <c>shoulder_base_units</c> = 24. 0 disables shoulder origins entirely.
+    /// </summary>
+    [JsonPropertyName("shoulderBaseUnits")] public float ShoulderBaseUnits { get; set; } = 24.0f;
+
+    /// <summary>
+    ///     Shoulder-peek offset added per millisecond of the observer's RTT: offset =
+    ///     clamp(pingMs·scale, <see cref="ShoulderBaseUnits" />, <see cref="MaxShoulderUnits" />). Upstream
+    ///     <c>shoulder_rtt_scale</c> = 0.64 (a 100ms peeker gets a 64u shoulder). 0 pins the offset at the base.
+    /// </summary>
+    [JsonPropertyName("shoulderRttScale")] public float ShoulderRttScale { get; set; } = 0.64f;
+
+    /// <summary>Upper clamp (units) on the RTT-scaled shoulder-peek offset. Upstream <c>max_shoulder_units</c> = 128.</summary>
+    [JsonPropertyName("maxShoulderUnits")] public float MaxShoulderUnits { get; set; } = 128.0f;
 
     /// <summary>
     ///     Minimum peek margin (units) added to the predicted travel distance so a corner-peeker is revealed

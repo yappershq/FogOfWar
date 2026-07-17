@@ -1,9 +1,19 @@
 {
   "enabled": true,
   "updateIntervalMs": 15,
+  // Peek-prediction lookahead is now PER-CLIENT and latency-aware: effective = clamp(minLookaheadMs + ping*
+  // rttLookaheadScale, 0, maxLookaheadMs). Real per-client ping (m_iPing) drives the RTT term, so a high-ping
+  // peeker leads further (matches what that client sees). minLookaheadMs = the 0-ping base (covers worker cadence).
   "minLookaheadMs": 180,
-  "maxLookaheadMs": 250,
+  "maxLookaheadMs": 375,
+  "rttLookaheadScale": 1.5,
+  // Only used while a client's ping is still 0 (mid-connect); real ping is used once it populates.
   "assumedRttMs": 60,
+  // RTT-scaled lateral shoulder-peek origins: offset = clamp(ping*shoulderRttScale, shoulderBaseUnits,
+  // maxShoulderUnits). Every observer gets a static +-shoulderBaseUnits peek even at 0 ping; set base 0 to disable.
+  "shoulderBaseUnits": 24,
+  "shoulderRttScale": 0.64,
+  "maxShoulderUnits": 128,
   "peekMarginUnits": 21,
   "visibilityHoldMs": 150,
   "maxPredictionSpeed": 500,
