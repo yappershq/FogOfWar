@@ -233,6 +233,9 @@ internal static class LosSampler
             if (!rs.Valid || !rs.Human)
                 continue;
 
+            // Precompute the receiver-only origins ONCE for this whole row — reused across every sender.
+            var geom = BuildReceiverGeom(in rs, los, in tuning);
+
             for (var s = 0; s < max; s++)
             {
                 if (s == r)
@@ -244,7 +247,7 @@ internal static class LosSampler
 
                 var pairIdx = (r * Slots) + s;
                 blocked[pairIdx] =
-                    PairBlocked(in rs, in ss, los, in tuning, smoke, ageAdvance, lastClear, pairIdx);
+                    PairBlocked(in geom, in ss, los, smoke, ageAdvance, lastClear, pairIdx);
             }
         }
     }
@@ -279,6 +282,11 @@ internal static class LosSampler
             if (!players[r].Valid || !players[r].Human)
                 return;
 
+            // Precompute the receiver-only origins ONCE for this row. Each row's slice of `blocked` is disjoint, so
+            // a per-row `lastClear` cache would in fact be race-free (each row touches only its own 64-byte line);
+            // this variant still runs cacheless for simplicity — the worker uses the serial cached path.
+            var geom = BuildReceiverGeom(in players[r], los, in tuning);
+
             for (var s = 0; s < max; s++)
             {
                 if (s == r)
@@ -287,13 +295,127 @@ internal static class LosSampler
                 if (!players[s].Valid || !ShouldCull(players[r].Team, players[s].Team, filterTeammates))
                     continue;
 
-                // No temporal-coherence cache here: a single shared hint buffer across parallel workers would
-                // race. The uncached path is boolean-identical (order-independent OR-of-clears).
                 blocked[(r * Slots) + s] =
-                    PairBlocked(in players[r], in players[s], los, in tuning, smoke, ageAdvance, null,
-                        (r * Slots) + s);
+                    PairBlocked(in geom, in players[s], los, smoke, ageAdvance, null, (r * Slots) + s);
             }
         });
+    }
+
+    /// <summary>Precomputed receiver-only sampling geometry (see <see cref="BuildReceiverGeom" />).</summary>
+    private readonly struct ReceiverGeom
+    {
+        public readonly float   Lookahead;    // effective (RTT-scaled) lookahead — also drives target prediction
+        public readonly float   PeekMargin;
+        public readonly float   MaxPredSpeed;
+        public readonly Vector3 O1;           // real eye (immovable baseline)
+        public readonly Vector3 O2;           // horizontal peek-predicted eye
+        public readonly bool    O2IsO1;       // o2 EXACTLY collapsed onto o1 (stationary / blocked peek) → dedupe o2 rays
+        public readonly bool    UseO3;
+        public readonly Vector3 O3;
+        public readonly bool    UseO4;
+        public readonly Vector3 O4;
+        public readonly Vector3 O5, O6, O7, O8; // shoulder peeks (o5/o6 off eye, o7/o8 off predicted eye)
+
+        public ReceiverGeom(
+            float lookahead, float peekMargin, float maxPredSpeed, Vector3 o1, Vector3 o2, bool o2IsO1,
+            bool useO3, Vector3 o3, bool useO4, Vector3 o4, Vector3 o5, Vector3 o6, Vector3 o7, Vector3 o8)
+        {
+            Lookahead    = lookahead;
+            PeekMargin   = peekMargin;
+            MaxPredSpeed = maxPredSpeed;
+            O1           = o1;
+            O2           = o2;
+            O2IsO1       = o2IsO1;
+            UseO3        = useO3;
+            O3           = o3;
+            UseO4        = useO4;
+            O4           = o4;
+            O5           = o5;
+            O6           = o6;
+            O7           = o7;
+            O8           = o8;
+        }
+    }
+
+    /// <summary>
+    ///     Precompute the receiver-only sampling geometry ONCE per receiver row: the effective (RTT-scaled) lookahead
+    ///     and every observer origin (o1 real eye, o2 horizontal-peek, o3 vertical-peek, o4 un-crouch, o5..o8 shoulder
+    ///     peeks). All of this — including up to ~10 BVH setup queries — depends ONLY on the receiver, so recomputing
+    ///     it for every sender was pure waste; <see cref="PairBlocked" /> now consumes the shared result. The values
+    ///     are byte-identical to the old per-pair computation, so the matrix is unchanged.
+    /// </summary>
+    private static ReceiverGeom BuildReceiverGeom(in SampledPlayer rs, LosQuery los, in SamplerTuning tuning)
+    {
+        var lookaheadSeconds = EffectiveLookahead(rs.Rtt, tuning);
+        var peekMargin       = tuning.PeekMargin;
+        var maxPredSpeed     = tuning.MaxPredSpeed;
+
+        // o1 = real eye (immovable baseline). o2 = horizontally peek-predicted eye — A4 keeps the LONGEST unblocked
+        // fraction of the predicted step (o1 rays never lost → fail-open); if every step is blocked o2 stays o1.
+        var o1      = rs.Eye;
+        var predObs = PredictionOffset(rs.Velocity, lookaheadSeconds, peekMargin, maxPredSpeed);
+
+        var o2 = o1;
+        if (predObs.X != 0f || predObs.Y != 0f)
+        {
+            if (!los.IsBlocked(o1, o1 + predObs))
+                o2 = o1 + predObs;
+            else if (!los.IsBlocked(o1, o1 + (predObs * 0.5f)))
+                o2 = o1 + (predObs * 0.5f);
+            else if (!los.IsBlocked(o1, o1 + (predObs * 0.25f)))
+                o2 = o1 + (predObs * 0.25f);
+        }
+
+        // o3 = vertical peek-predicted eye (jump-peek / drop-off); A5 = vertical-only fallback if the diagonal is
+        // blocked. Additive origin (only fires when it clears from o1).
+        var useO3 = false;
+        var o3    = o1;
+        if (lookaheadSeconds > 0f && MathF.Abs(rs.Velocity.Z) > MinPredSpeed)
+        {
+            var zVel     = MathF.Max(-maxPredSpeed, MathF.Min(maxPredSpeed, rs.Velocity.Z));
+            var vertical = new Vector3(0f, 0f, zVel * lookaheadSeconds);
+            o3 = o1 + predObs + vertical;
+            if (!los.IsBlocked(o1, o3))
+            {
+                useO3 = true;
+            }
+            else
+            {
+                o3    = o1 + vertical;
+                useO3 = !los.IsBlocked(o1, o3);
+            }
+        }
+
+        // o4 = un-crouch eye (A7): a ducked observer's velocity ≈ 0, so raise the eye to standing to predict the
+        // sightline the un-crouch opens. Dropped if peeking from inside geometry.
+        var useO4 = false;
+        var o4    = o1;
+        if (rs.Ducked)
+        {
+            o4    = o1 + new Vector3(0f, 0f, UnCrouchEyeRise);
+            useO4 = !los.IsBlocked(o1, o4);
+        }
+
+        // o5..o8 = RTT-scaled shoulder peeks. o5/o6 flank the real eye, o7/o8 the predicted eye; SafeOrigin reverts a
+        // shoulder that would peek from inside geometry back to its base. Skipped entirely when disabled (base 0).
+        var shoulderOff = ShoulderOffset(rs.Rtt, in tuning);
+        var o5 = o1;
+        var o6 = o1;
+        var o7 = o2;
+        var o8 = o2;
+        if (shoulderOff > 0f)
+        {
+            var shoulder = EyeRight(rs.Yaw) * shoulderOff;
+            o5 = SafeOrigin(los, o1, o1 - shoulder);
+            o6 = SafeOrigin(los, o1, o1 + shoulder);
+            o7 = SafeOrigin(los, o2, o2 - shoulder);
+            o8 = SafeOrigin(los, o2, o2 + shoulder);
+        }
+
+        // O2IsO1 uses EXACT equality (o2 was assigned `= o1` when it collapsed) — it gates the ray-dedup below, and
+        // removing only bitwise-duplicate rays cannot change the OR-of-clears, so the boolean is preserved.
+        return new ReceiverGeom(
+            lookaheadSeconds, peekMargin, maxPredSpeed, o1, o2, o2 == o1, useO3, o3, useO4, o4, o5, o6, o7, o8);
     }
 
     /// <summary>
@@ -308,98 +430,22 @@ internal static class LosSampler
     ///     sweep, which cannot change an OR — same boolean.</para>
     /// </summary>
     private static bool PairBlocked(
-        in SampledPlayer rs,
+        in ReceiverGeom  geom,
         in SampledPlayer ss,
         LosQuery         los,
-        in SamplerTuning tuning,
         SmokeSnapshot?   smoke,
         float            ageAdvance,
         byte[]?          lastClear,
         int              pairIdx)
     {
-        // Effective lookahead scales with the RECEIVER's RTT — a high-ping observer predicts further, matching what
-        // that client actually sees when it peeks. Additive prediction (o1 immovable), so a larger lookahead only
-        // ever converts hidden→visible. peekMargin / maxPredSpeed come from the same tuning.
-        var lookaheadSeconds = EffectiveLookahead(rs.Rtt, tuning);
-        var peekMargin       = tuning.PeekMargin;
-        var maxPredSpeed     = tuning.MaxPredSpeed;
-
-        // ── Observer origins ──────────────────────────────────────────────────────────────────────────────
-        // o1 = real eye (the immovable baseline). o2 = horizontally peek-predicted eye.
-        var o1      = rs.Eye;
-        var predObs = PredictionOffset(rs.Velocity, lookaheadSeconds, peekMargin, maxPredSpeed);
-
-        // A4: instead of collapsing o2 straight to o1 when the full peek step is blocked (wall-hugging peeks then
-        // got ZERO lead), keep the LONGEST unblocked fraction of the predicted step as o2. o1's rays are never
-        // lost, so whatever fraction o2 lands on can only ADD clear-ray chances → strictly fail-open.
-        var o2 = o1;
-        if (predObs.X != 0f || predObs.Y != 0f)
-        {
-            if (!los.IsBlocked(o1, o1 + predObs))
-                o2 = o1 + predObs;
-            else if (!los.IsBlocked(o1, o1 + (predObs * 0.5f)))
-                o2 = o1 + (predObs * 0.5f);
-            else if (!los.IsBlocked(o1, o1 + (predObs * 0.25f)))
-                o2 = o1 + (predObs * 0.25f);
-            // else: every peek step blocked → o2 stays o1 (reverts to the original collapse — still safe).
-        }
-
-        // o3 = vertical peek-predicted eye (jump-peek / drop-off). A pure jump has velocity ≈ (0,0,+302) so the
-        // horizontal predObs is zero and o2 collapses to o1 — leaving a rising eye with ZERO lookahead. o3 fixes
-        // that by predicting the eye's Z travel (rising +Z and falling −Z both open new sightlines). The
-        // horizontal predObs is folded in so a diagonal jump-peek is predicted diagonally.
-        //
-        // Collapse rule: if o1→o3 is blocked, A5 retries a VERTICAL-ONLY o3 (drop the horizontal component — a
-        // diagonal jump-peek along a wall otherwise loses both o2 and o3) before dropping o3 entirely. o3 is an
-        // additive origin, so any of these variants can only convert hidden→visible.
-        var useO3 = false;
-        var o3    = o1;
-        if (lookaheadSeconds > 0f && MathF.Abs(rs.Velocity.Z) > MinPredSpeed)
-        {
-            var zVel     = MathF.Max(-maxPredSpeed, MathF.Min(maxPredSpeed, rs.Velocity.Z));
-            var vertical = new Vector3(0f, 0f, zVel * lookaheadSeconds);
-            o3 = o1 + predObs + vertical; // diagonal jump/drop-off peek
-            if (!los.IsBlocked(o1, o3))
-            {
-                useO3 = true;
-            }
-            else
-            {
-                o3    = o1 + vertical; // A5: vertical-only fallback
-                useO3 = !los.IsBlocked(o1, o3);
-            }
-        }
-
-        // o4 = un-crouch eye (A7). A ducked observer has velocity ≈ 0, so o2/o3 never fire and an un-crouch peek
-        // has zero lookahead today. Raising the eye to standing height predicts the sightline the un-crouch opens.
-        // Additive origin, dropped if peeking from inside geometry (o1→o4 blocked).
-        var useO4 = false;
-        var o4    = o1;
-        if (rs.Ducked)
-        {
-            o4    = o1 + new Vector3(0f, 0f, UnCrouchEyeRise);
-            useO4 = !los.IsBlocked(o1, o4);
-        }
-
-        // o5..o8 = RTT-scaled shoulder-peek eyes (upstream left/right shoulder origins). The lateral offset is the
-        // eye's right vector × ShoulderOffset(rtt): every observer gets at least ±ShoulderBase (a static shoulder
-        // peek even at 0 ping), widening to ±MaxShoulder at high ping. o5/o6 flank the real eye; o7/o8 flank the
-        // horizontally-peek-predicted eye (o2). SafeOrigin reverts a shoulder that would peek from inside geometry
-        // back to its base, and a shoulder equal to its base is skipped at assembly — so these are pure additive,
-        // fail-open origins (they can only add clear-ray chances, never hide a visible pair).
-        var shoulderOff = ShoulderOffset(rs.Rtt, in tuning);
-        var o5 = o1; // left  shoulder (real eye)
-        var o6 = o1; // right shoulder (real eye)
-        var o7 = o2; // left  shoulder (predicted eye)
-        var o8 = o2; // right shoulder (predicted eye)
-        if (shoulderOff > 0f) // shoulders disabled (base 0) → skip the SafeOrigin BVH queries entirely
-        {
-            var shoulder = EyeRight(rs.Yaw) * shoulderOff;
-            o5 = SafeOrigin(los, o1, o1 - shoulder);
-            o6 = SafeOrigin(los, o1, o1 + shoulder);
-            o7 = SafeOrigin(los, o2, o2 - shoulder);
-            o8 = SafeOrigin(los, o2, o2 + shoulder);
-        }
+        // Receiver-side origins (o1..o8) + effective lookahead are precomputed ONCE per receiver row in
+        // BuildReceiverGeom and reused for every sender — recomputing them per pair (incl. ~10 BVH setup queries)
+        // was pure waste. Sender-side prediction below still uses the receiver's effective lookahead / peek tuning.
+        var o1               = geom.O1;
+        var o2               = geom.O2;
+        var lookaheadSeconds = geom.Lookahead;
+        var peekMargin       = geom.PeekMargin;
+        var maxPredSpeed     = geom.MaxPredSpeed;
 
         // ── Target AABB (NOW box) — the box is NEVER relocated; the merge only ADDS points (A3) ──────────────
         // ±X/±Y inflated by BoundsInflate, but the box FLOOR is clamped to origin.Z + FloorEpsilon (never pushed
@@ -472,48 +518,57 @@ internal static class LosSampler
             n++;
         }
 
-        // (2) o2 horizontal-peek eye → 8 shared points + 4 mid-edge points (A1). Always present (o2 may equal o1).
-        for (var i = 0; i < SharedPoints; i++)
-        {
-            rayO[n] = o2;
-            rayT[n] = staticPts[i];
-            n++;
-        }
-        for (var i = 0; i < MidEdgePoints; i++)
-        {
-            rayO[n] = o2;
-            rayT[n] = staticPts[MidEdgeStart + i];
-            n++;
-        }
-
-        // (3) o3 vertical-peek eye → 8 shared points (A8: was 5), when used.
-        if (useO3)
+        // (2) o2 horizontal-peek eye → 8 shared + 4 mid-edge points (A1). SKIPPED when o2 exactly collapsed onto o1
+        // (stationary / fully-blocked peek): those 12 points are already sampled from o1 in group (1), so the o2
+        // rays would be bitwise duplicates — dropping duplicates can't change the OR-of-clears (fail-open holds).
+        if (!geom.O2IsO1)
         {
             for (var i = 0; i < SharedPoints; i++)
             {
-                rayO[n] = o3;
+                rayO[n] = o2;
+                rayT[n] = staticPts[i];
+                n++;
+            }
+            for (var i = 0; i < MidEdgePoints; i++)
+            {
+                rayO[n] = o2;
+                rayT[n] = staticPts[MidEdgeStart + i];
+                n++;
+            }
+        }
+
+        // (3) o3 vertical-peek eye → 8 shared points (A8: was 5), when used.
+        if (geom.UseO3)
+        {
+            for (var i = 0; i < SharedPoints; i++)
+            {
+                rayO[n] = geom.O3;
                 rayT[n] = staticPts[i];
                 n++;
             }
         }
 
         // (4) o4 un-crouch eye → 8 shared points (A7), when used.
-        if (useO4)
+        if (geom.UseO4)
         {
             for (var i = 0; i < SharedPoints; i++)
             {
-                rayO[n] = o4;
+                rayO[n] = geom.O4;
                 rayT[n] = staticPts[i];
                 n++;
             }
         }
 
-        // (4b) o5..o8 RTT-scaled shoulder eyes → 8 shared points each. A shoulder that collapsed onto its base eye
-        // (offset 0, or reverted through a wall) is a pure duplicate of an origin already swept, so it is skipped.
-        n = AppendSharedRays(o5, o1, staticPts, rayO, rayT, n);
-        n = AppendSharedRays(o6, o1, staticPts, rayO, rayT, n);
-        n = AppendSharedRays(o7, o2, staticPts, rayO, rayT, n);
-        n = AppendSharedRays(o8, o2, staticPts, rayO, rayT, n);
+        // (4b) o5..o8 RTT-scaled shoulder eyes → 8 shared points each. o5/o6 flank the real eye; o7/o8 flank the
+        // predicted eye — but when o2 collapsed onto o1, o7/o8 are bitwise-identical to o5/o6, so skip them. A
+        // shoulder that reverted to its base is likewise a duplicate and skipped by AppendSharedRays.
+        n = AppendSharedRays(geom.O5, o1, staticPts, rayO, rayT, n);
+        n = AppendSharedRays(geom.O6, o1, staticPts, rayO, rayT, n);
+        if (!geom.O2IsO1)
+        {
+            n = AppendSharedRays(geom.O7, o2, staticPts, rayO, rayT, n);
+            n = AppendSharedRays(geom.O8, o2, staticPts, rayO, rayT, n);
+        }
 
         // (5) A3 future-box leading corners → o1, when the box travels unobstructed.
         if (useFutureCorners)
@@ -526,7 +581,8 @@ internal static class LosSampler
             }
         }
 
-        // (6) A6 vertical-predicted corners → o1 AND o2, when the target is jumping / falling.
+        // (6) A6 vertical-predicted corners → o1 AND o2, when the target is jumping / falling. The o2 copy is
+        // skipped when o2 collapsed onto o1 (it would be a bitwise duplicate of the o1 copy).
         if (useVertCorners)
         {
             for (var i = 0; i < A6VerticalCorners; i++)
@@ -535,23 +591,30 @@ internal static class LosSampler
                 rayT[n] = vertCorners[i];
                 n++;
             }
-            for (var i = 0; i < A6VerticalCorners; i++)
+            if (!geom.O2IsO1)
             {
-                rayO[n] = o2;
-                rayT[n] = vertCorners[i];
-                n++;
+                for (var i = 0; i < A6VerticalCorners; i++)
+                {
+                    rayO[n] = o2;
+                    rayT[n] = vertCorners[i];
+                    n++;
+                }
             }
         }
 
         // (7) Held-weapon muzzle point → o1 AND o2, when the target holds a gun. Additive (barrel-visible ⇒ reveal).
+        // The o2 copy is skipped when o2 collapsed onto o1.
         if (haveMuzzle)
         {
             rayO[n] = o1;
             rayT[n] = muzzlePt;
             n++;
-            rayO[n] = o2;
-            rayT[n] = muzzlePt;
-            n++;
+            if (!geom.O2IsO1)
+            {
+                rayO[n] = o2;
+                rayT[n] = muzzlePt;
+                n++;
+            }
         }
 
         // ── Sweep: any clear ray ⇒ visible (first-clear early-out). No budget cap. ────────────────────────────
@@ -559,8 +622,9 @@ internal static class LosSampler
         {
             // Temporal coherence: test the ray that cleared this pair LAST pass first. Reordering an OR-of-clears
             // sweep cannot change its boolean, so this is answer-preserving — it just reaches the early-out sooner
-            // when the world barely moved between passes. A stale / out-of-range hint (map change, or a conditional
-            // group toggled so the ray count shrank) is simply skipped and the full sweep runs.
+            // when the world barely moved between passes. An out-of-range hint (map change, or a conditional group
+            // toggled so the ray count shrank) is skipped by the `hint < n` guard; an in-range hint that no longer
+            // clears is simply tested once and folded into the full sweep below — either way the boolean is exact.
             int hint = lastClear[pairIdx];
             if (hint < n && RayClear(los, smoke, ageAdvance, rayO[hint], rayT[hint]))
                 return false; // still visible via the remembered ray — keep the hint
