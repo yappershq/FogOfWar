@@ -27,6 +27,8 @@ namespace FogOfWar.Engine;
 ///             The NOW-box points are NEVER relocated (that relocation was the false-hide bug).</item>
 ///       <item>A6 — vertical-predicted corners (target jumping / falling) — sampled from o1 AND o2, when the
 ///             target has real vertical speed.</item>
+///       <item>muzzle — the barrel point of the target's active gun (upstream muzzle sampling), sampled from o1
+///             AND o2 when the target holds a gun (a peeker who sees the barrel sees the player).</item>
 ///     </list>
 ///
 ///     <para><b>Fail-open / monotone.</b> The result is <c>blocked == !(∃ clear ray)</c>. Because o1 samples a
@@ -71,11 +73,16 @@ internal static class LosSampler
     // shoulder that would peek from inside geometry back to its base eye; duplicates are skipped).
     private const int ShoulderOrigins = 4;
 
+    // Held-weapon muzzle target point (upstream muzzle sampling): the barrel of the target's active gun sticks out
+    // past the body, so a peeker who can see the muzzle can see the player. Added as ONE extra target point sampled
+    // from o1 AND o2 (the two most likely eyes to catch it) → 2 rays. Additive: a gun-barrel point can only reveal.
+    private const int MuzzleRays = 2;
+
     // Worst-case ray count (stackalloc scratch): o1×15 + o2×12 + o3×8 + o4×8 + 4 shoulders×8 + A3×8 + A6×(4×2)
-    // = 91. Always < 255, so a byte temporal-coherence hint index is never ambiguous with NoClearHint (0xFF).
+    // + muzzle×2 = 93. Always < 255, so a byte temporal-coherence hint index is never ambiguous with NoClearHint.
     private const int MaxRays =
         StaticPoints + O2Points + SharedPoints /*o3*/ + SharedPoints /*o4*/ + (ShoulderOrigins * SharedPoints)
-        + A3FutureCorners + (A6VerticalCorners * 2);
+        + A3FutureCorners + (A6VerticalCorners * 2) + MuzzleRays;
 
     // Temporal-coherence hint sentinel: "no ray is remembered as last-clearing this pair" (pair fully blocked, or
     // never sampled). Any value >= the pass's ray count is treated as absent, so 0xFF is always out of range.
@@ -101,6 +108,12 @@ internal static class LosSampler
     private const float DegToRad       = 0.017453292519943295f;
     private const float SamePointEpsSq = 1.0e-4f;
 
+    // Muzzle-point geometry (upstream k_muzzle_z / k_standing_player_height / k_pelvis_height). The barrel local point
+    // is (length, 0, MuzzleZ) in the target's frame; MuzzleZ is scaled for a crouched target via AdjustedLocalZ.
+    private const float MuzzleZ              = 60.0f;
+    private const float StandingPlayerHeight = 72.0f;
+    private const float PelvisHeight         = 38.0f;
+
     // CS2 team numbering (Sharp.Shared.Enums.CStrikeTeam: TE=2, CT=3). The engine stays ModSharp-free by
     // comparing the raw int the module copies in via (int)team — only strictly-opposing T-vs-CT pairs sample.
     private const int TeamT  = 2;
@@ -121,8 +134,9 @@ internal static class LosSampler
         public Vector3 Velocity;
         public Vector3 Mins;     // local collision mins
         public Vector3 Maxs;     // local collision maxs
-        public float   Yaw;      // observer eye yaw (degrees) — builds the RTT-scaled shoulder origins
+        public float   Yaw;      // eye yaw (degrees) — observer shoulder origins AND target muzzle-point direction
         public float   Rtt;      // observer round-trip time (seconds, from m_iPing) — scales lookahead + shoulder width
+        public ushort  WeaponItemDef; // target's active-weapon item-definition index (0 = none/knife → no muzzle point)
     }
 
     /// <summary>
@@ -432,6 +446,19 @@ internal static class LosSampler
             useVertCorners = true;
         }
 
+        // Muzzle point (upstream held-weapon muzzle sampling): the barrel of the target's active gun juts out past
+        // the body, so an observer who can see the muzzle can see the player. World point = origin + forward·length
+        // at a crouch-scaled MuzzleZ. Only guns produce a length (knife/grenade/none → 0 → skipped). Additive.
+        var muzzleLen  = MuzzleLength(ss.WeaponItemDef);
+        var haveMuzzle = muzzleLen > 0f;
+        var muzzlePt   = default(Vector3);
+        if (haveMuzzle)
+        {
+            var fwd = EyeForward(ss.Yaw);
+            var mz  = ss.Origin.Z + AdjustedLocalZ(ss.Mins.Z, ss.Maxs.Z, MuzzleZ);
+            muzzlePt = new Vector3((ss.Origin.X + (fwd.X * muzzleLen)), (ss.Origin.Y + (fwd.Y * muzzleLen)), mz);
+        }
+
         // ── Assemble the ADDITIVE ray set (origins × target points) ──────────────────────────────────────────
         Span<Vector3> rayO = stackalloc Vector3[MaxRays];
         Span<Vector3> rayT = stackalloc Vector3[MaxRays];
@@ -514,6 +541,17 @@ internal static class LosSampler
                 rayT[n] = vertCorners[i];
                 n++;
             }
+        }
+
+        // (7) Held-weapon muzzle point → o1 AND o2, when the target holds a gun. Additive (barrel-visible ⇒ reveal).
+        if (haveMuzzle)
+        {
+            rayO[n] = o1;
+            rayT[n] = muzzlePt;
+            n++;
+            rayO[n] = o2;
+            rayT[n] = muzzlePt;
+            n++;
         }
 
         // ── Sweep: any clear ray ⇒ visible (first-clear early-out). No budget cap. ────────────────────────────
@@ -678,6 +716,43 @@ internal static class LosSampler
         }
         return n;
     }
+
+    /// <summary>upstream <c>eye_forward</c>: the forward vector (unit, XY plane) from a yaw — aims the muzzle point.</summary>
+    private static Vector3 EyeForward(float yawDegrees)
+    {
+        var yaw = yawDegrees * DegToRad;
+        return new Vector3(MathF.Cos(yaw), MathF.Sin(yaw), 0f);
+    }
+
+    /// <summary>
+    ///     upstream <c>adjusted_local_z</c>: map a standing-model local Z onto the target's live (possibly crouched)
+    ///     hull so the muzzle point drops when the target ducks. Below the pelvis the mapping is 1:1; above it scales
+    ///     by the live upper-body height. Returns a Z offset relative to the target origin (already includes minZ).
+    /// </summary>
+    private static float AdjustedLocalZ(float minZ, float maxZ, float localZ)
+    {
+        var height = MathF.Max(1f, maxZ - minZ);
+        if (localZ < PelvisHeight)
+            return minZ + localZ;
+        var standingUpper = StandingPlayerHeight - PelvisHeight;
+        var liveUpper     = MathF.Max(0f, height - PelvisHeight);
+        return minZ + PelvisHeight + ((localZ - PelvisHeight) * liveUpper / standingUpper);
+    }
+
+    /// <summary>
+    ///     Barrel length (units) of the target's active weapon by item-definition index — upstream muzzle table:
+    ///     pistol 18 / smg 28 / rifle 36 (incl. shotguns/LMGs) / sniper 52. Knife, grenade, or unknown ⇒ 0 (no
+    ///     muzzle point). Item-def numbers match CS2FOW's <c>weapon_muzzle_class_from_item_definition</c>.
+    /// </summary>
+    private static float MuzzleLength(ushort itemDef)
+        => itemDef switch
+        {
+            1 or 2 or 3 or 4 or 30 or 32 or 36 or 61 or 63 or 64                     => 18f, // pistols
+            17 or 19 or 23 or 24 or 26 or 33 or 34                                   => 28f, // smgs
+            9 or 11 or 38 or 40                                                      => 52f, // snipers
+            7 or 8 or 10 or 13 or 14 or 16 or 25 or 27 or 28 or 29 or 35 or 39 or 60 => 36f, // rifles/shotguns/lmg
+            _                                                                       => 0f,
+        };
 
     /// <summary>
     ///     Pair-eligibility predicate on raw team ints (2=T, 3=CT). Both sides MUST be a real playing team (T or

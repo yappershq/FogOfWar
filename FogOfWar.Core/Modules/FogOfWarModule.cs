@@ -148,8 +148,9 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
         public Vector      Velocity;
         public Vector      Mins;      // local collision mins
         public Vector      Maxs;      // local collision maxs
-        public float       Yaw;       // observer eye yaw (degrees) — RTT-scaled shoulder origins
+        public float       Yaw;       // eye yaw (degrees) — observer shoulder origins AND target muzzle direction
         public float       Rtt;       // observer round-trip time (seconds, from m_iPing) — scales lookahead + shoulders
+        public ushort      WeaponItemDef; // target's active-weapon item-def index (0 = none/knife → no muzzle point)
         public EntityIndex CtrlIndex; // controller entity index (== slot + 1)
     }
 
@@ -753,6 +754,9 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 Rtt       = controller.GetNetVar<uint>("m_iPing") is var ping && ping > 0
                                 ? ping / 1000f
                                 : _assumedRttSeconds,
+                // Active gun's item-def → its barrel adds a muzzle target point (a peeker who sees the barrel sees
+                // the player). No weapon / knife / grenade ⇒ 0 ⇒ no muzzle point.
+                WeaponItemDef = pawn.GetActiveWeapon()?.ItemDefinitionIndex ?? 0,
                 CtrlIndex = ctrlIndex,
             };
         }
@@ -786,6 +790,7 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 Maxs     = ToV3(s.Maxs),
                 Yaw      = s.Yaw,
                 Rtt      = s.Rtt,
+                WeaponItemDef = s.WeaponItemDef,
             };
         }
 
