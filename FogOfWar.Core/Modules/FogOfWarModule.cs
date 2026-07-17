@@ -1773,6 +1773,28 @@ internal sealed class FogOfWarModule : IClientListener, IEntityListener, IGameLi
                 _bridge.TransmitManager.SetEntityOwner(widx, s.CtrlIndex);
                 _weaponOwner[widx] = s.CtrlIndex;
             }
+
+            // Carried hostage prop (cs_ maps): the model shown on a carrier's back leaks their position to ESP, so
+            // hide it WITH the carrier via the same owner-link path. Recorded in _weaponSeen like a weapon, so the
+            // gone-sweep below un-links it (2-frame) once the hostage is dropped / rescued. Same dirty-check + fail-
+            // open behaviour (an unhooked prop just stays visible). Wearables (m_hMyWearables) are not linked: CS2
+            // bakes gloves/agent cosmetics into the pawn model, so that list is empty in practice.
+            if (pawn.GetHostageService()?.CarriedHostagePropHandle is { } hHandle
+                && hHandle.IsValid()
+                && _bridge.EntityManager.FindEntityByHandle(hHandle) is { } hostageProp)
+            {
+                var hidx = hostageProp.Index;
+                _weaponSeen.Add(hidx);
+                if (!(_weaponOwner.TryGetValue(hidx, out var hLinked) && hLinked == s.CtrlIndex))
+                {
+                    if (!_bridge.TransmitManager.IsEntityHooked(hostageProp)
+                        && _bridge.TransmitManager.AddEntityHooks(hostageProp, true))
+                        _weHookedWeapons.Add(hidx);
+
+                    _bridge.TransmitManager.SetEntityOwner(hidx, s.CtrlIndex);
+                    _weaponOwner[hidx] = s.CtrlIndex;
+                }
+            }
         }
 
         // Weapons that left an inventory (drop / death) must become owner-less so they stop being culled — but
